@@ -49,24 +49,6 @@
         <a-form-item label="显存">
           <a-input v-model:value="form.memory" placeholder="如：80GB" />
         </a-form-item>
-        <a-form-item label="FP8算力">
-          <a-input v-model:value="form.fp8_perf" placeholder="如：2977 TFLOPS" />
-        </a-form-item>
-        <a-form-item label="INT8算力">
-          <a-input v-model:value="form.int8_perf" placeholder="如：2977 TOPS" />
-        </a-form-item>
-        <a-form-item label="BF16算力">
-          <a-input v-model:value="form.bf16_perf" placeholder="如：1489 TFLOPS" />
-        </a-form-item>
-        <a-form-item label="FP16算力">
-          <a-input v-model:value="form.fp16_perf" placeholder="如：1489 TFLOPS" />
-        </a-form-item>
-        <a-form-item label="FP32算力">
-          <a-input v-model:value="form.fp32_perf" placeholder="如：93 TFLOPS" />
-        </a-form-item>
-        <a-form-item label="卡间互联带宽">
-          <a-input v-model:value="form.interconnect_bandwidth" placeholder="如：900 GB/s" />
-        </a-form-item>
       </a-form>
     </a-modal>
   </div>
@@ -91,25 +73,13 @@ export default {
     const form = ref({
       name: '',
       model: '',
-      memory: '',
-      fp8_perf: '',
-      int8_perf: '',
-      bf16_perf: '',
-      fp16_perf: '',
-      fp32_perf: '',
-      interconnect_bandwidth: ''
+      memory: ''
     })
 
     const columns = [
       { title: '名称', dataIndex: 'name', key: 'name' },
       { title: '型号', dataIndex: 'model', key: 'model' },
       { title: '显存', dataIndex: 'memory', key: 'memory' },
-      { title: 'FP8算力', dataIndex: 'fp8_perf', key: 'fp8_perf' },
-      { title: 'INT8算力', dataIndex: 'int8_perf', key: 'int8_perf' },
-      { title: 'BF16算力', dataIndex: 'bf16_perf', key: 'bf16_perf' },
-      { title: 'FP16算力', dataIndex: 'fp16_perf', key: 'fp16_perf' },
-      { title: 'FP32算力', dataIndex: 'fp32_perf', key: 'fp32_perf' },
-      { title: '卡间互联带宽', dataIndex: 'interconnect_bandwidth', key: 'interconnect_bandwidth' },
       { title: '操作', key: 'action' }
     ]
 
@@ -134,13 +104,7 @@ export default {
       form.value = {
         name: '',
         model: '',
-        memory: '',
-        fp8_perf: '',
-        int8_perf: '',
-        bf16_perf: '',
-        fp16_perf: '',
-        fp32_perf: '',
-        interconnect_bandwidth: ''
+        memory: ''
       }
       modalVisible.value = true
     }

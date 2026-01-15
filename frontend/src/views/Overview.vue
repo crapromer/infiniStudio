@@ -276,8 +276,8 @@ export default {
 
     onMounted(() => {
       loadData()
-      // 每30秒检查一次服务器状态
-      statusCheckInterval = setInterval(checkServerStatus, 30000)
+      // 每秒检查一次服务器状态
+      statusCheckInterval = setInterval(checkServerStatus, 1000)
       // 立即检查一次
       checkServerStatus()
     })

@@ -61,12 +61,6 @@ def init_db():
             name TEXT NOT NULL,
             model TEXT NOT NULL,
             memory TEXT,
-            fp8_perf TEXT,
-            int8_perf TEXT,
-            bf16_perf TEXT,
-            fp16_perf TEXT,
-            fp32_perf TEXT,
-            interconnect_bandwidth TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (brand_id) REFERENCES brands(id)
         )
@@ -333,11 +327,9 @@ def create_accelerator(brand_id):
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO accelerator_cards 
-        (brand_id, name, model, memory, fp8_perf, int8_perf, bf16_perf, fp16_perf, fp32_perf, interconnect_bandwidth)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (brand_id, data['name'], data['model'], data.get('memory'), 
-          data.get('fp8_perf'), data.get('int8_perf'), data.get('bf16_perf'), 
-          data.get('fp16_perf'), data.get('fp32_perf'), data.get('interconnect_bandwidth')))
+        (brand_id, name, model, memory)
+        VALUES (?, ?, ?, ?)
+    ''', (brand_id, data['name'], data['model'], data.get('memory')))
     conn.commit()
     accelerator_id = cursor.lastrowid
     conn.close()
@@ -350,12 +342,9 @@ def update_accelerator(accelerator_id):
     cursor = conn.cursor()
     cursor.execute('''
         UPDATE accelerator_cards 
-        SET name = ?, model = ?, memory = ?, fp8_perf = ?, int8_perf = ?, 
-            bf16_perf = ?, fp16_perf = ?, fp32_perf = ?, interconnect_bandwidth = ?
+        SET name = ?, model = ?, memory = ?
         WHERE id = ?
-    ''', (data['name'], data['model'], data.get('memory'), data.get('fp8_perf'), 
-          data.get('int8_perf'), data.get('bf16_perf'), data.get('fp16_perf'), 
-          data.get('fp32_perf'), data.get('interconnect_bandwidth'), accelerator_id))
+    ''', (data['name'], data['model'], data.get('memory'), accelerator_id))
     conn.commit()
     conn.close()
     return jsonify({'message': 'Accelerator updated successfully'})
@@ -771,7 +760,8 @@ def execute_ssh_command(server, command):
         # 使用bash -l -c来执行命令，这样可以加载完整的登录环境
         # -l 表示登录shell，会加载 ~/.bash_profile, ~/.bashrc 等
         # 同时使用get_pty=True获取伪终端，这对于某些命令很重要
-        full_command = f"bash -l -c '{escaped_command}'"
+        full_command = f"bash -lc '{escaped_command}'"
+        print(full_command)
         
         stdin, stdout, stderr = ssh.exec_command(full_command, get_pty=True)
         

@@ -104,6 +104,16 @@ export default {
       sending.value = true
 
       try {
+        // 立即添加用户消息到前端显示
+        const userMsg = {
+          id: 'user-' + Date.now(),
+          role: 'user',
+          content: userMessage,
+          created_at: new Date().toISOString()
+        }
+        messages.value.push(userMsg)
+        scrollToBottom()
+
         // 添加用户消息到数据库
         await addChatMessage(serviceId, {
           role: 'user',
@@ -115,10 +125,6 @@ export default {
           role: msg.role,
           content: msg.content
         }))
-        apiMessages.push({
-          role: 'user',
-          content: userMessage
-        })
 
         // 调用大模型API（流式响应）
         const requestData = {
@@ -143,11 +149,21 @@ export default {
 
         // 处理流式响应
         let fullResponse = ''
+        let buffer = ''  // 用于处理不完整的行
         try {
-          const response = await fetch(`/api/services/${serviceId}/chat/completions`, {
+          // 流式请求：开发环境下尽量绕过 devServer(8080) proxy，避免 SSE 被缓冲成“一次性输出”
+          const apiBase =
+            (process.env.VUE_APP_API_BASE && process.env.VUE_APP_API_BASE.trim()) ||
+            (process.env.NODE_ENV === 'development'
+              ? `http://${window.location.hostname}:5000`
+              : '')
+
+          const response = await fetch(`${apiBase}/api/services/${serviceId}/chat/completions`, {
             method: 'POST',
             headers: {
-              'Content-Type': 'application/json'
+              'Content-Type': 'application/json',
+              'Accept': 'text/event-stream',
+              'Cache-Control': 'no-cache'
             },
             body: JSON.stringify(requestData)
           })
@@ -163,22 +179,35 @@ export default {
             const { done, value } = await reader.read()
             if (done) break
 
+            // 解码数据块
             const chunk = decoder.decode(value, { stream: true })
-            const lines = chunk.split('\n')
+            buffer += chunk
+
+            // 处理完整的行
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''  // 保留最后不完整的行
 
             for (const line of lines) {
+              if (!line.trim()) continue  // 跳过空行
+              
               if (line.startsWith('data: ')) {
-                const data = line.slice(6)
-                if (data === '[DONE]') {
+                const data = line.slice(6).trim()
+                if (data === '[DONE]' || data === '') {
                   continue
                 }
                 try {
                   const json = JSON.parse(data)
+                  console.log('收到SSE数据:', json)  // 调试日志
+                  
                   if (json.choices && json.choices.length > 0) {
-                    const delta = json.choices[0].delta
-                    if (delta && delta.content) {
-                      fullResponse += delta.content
-                      // 更新临时消息内容
+                    const choice = json.choices[0]
+                    const delta = choice.delta
+
+                    // 统一增量累加：优先 delta.content，其次 choice.text（有些实现会把 token 放在 text 字段）
+                    const piece = (delta && delta.content) ? delta.content : (choice.text || '')
+                    if (piece) {
+                      fullResponse += piece
+                      // 实时更新临时消息内容
                       const tempMsg = messages.value.find(m => m.id === tempAssistantMessage.id)
                       if (tempMsg) {
                         tempMsg.content = fullResponse
@@ -187,26 +216,63 @@ export default {
                     }
                   }
                 } catch (e) {
-                  // 忽略解析错误
+                  console.error('解析SSE数据失败:', e, '原始数据:', data)
                 }
               }
             }
           }
 
-          // 流式响应完成，保存到数据库
+          // 处理剩余的数据
+          if (buffer.trim()) {
+            const line = buffer.trim()
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim()
+              if (data && data !== '[DONE]') {
+                try {
+                  const json = JSON.parse(data)
+                  if (json.choices && json.choices.length > 0) {
+                    const choice = json.choices[0]
+                    const delta = choice.delta
+                    const piece = (delta && delta.content) ? delta.content : (choice.text || '')
+                    if (piece) {
+                      fullResponse += piece
+                      const tempMsg = messages.value.find(m => m.id === tempAssistantMessage.id)
+                      if (tempMsg) {
+                        tempMsg.content = fullResponse
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.error('解析剩余SSE数据失败:', e, data)
+                }
+              }
+            }
+          }
+
+          // 流式响应完成：不移除临时消息，直接“转正”为最终assistant消息，避免闪烁
+          const tempMsg = messages.value.find(m => m.id === tempAssistantMessage.id)
+          if (tempMsg) {
+            tempMsg.content = fullResponse || tempMsg.content || ''
+          }
+
+          // 保存到数据库（成功后可用返回的id/created_at更新临时消息，保持一致性）
           if (fullResponse) {
-            await addChatMessage(serviceId, {
+            const saved = await addChatMessage(serviceId, {
               role: 'assistant',
               content: fullResponse
             })
+            if (saved && saved.data && tempMsg) {
+              // 兼容后端可能返回 {id, created_at, ...}
+              if (saved.data.id) tempMsg.id = saved.data.id
+              if (saved.data.created_at) tempMsg.created_at = saved.data.created_at
+            }
           }
-
-          // 移除临时消息，重新加载消息列表
-          messages.value = messages.value.filter(m => m.id !== tempAssistantMessage.id)
-          await loadMessages()
         } catch (error) {
-          // 移除临时消息
-          messages.value = messages.value.filter(m => m.id !== tempAssistantMessage.id)
+          // 保留临时消息并标记错误，避免“闪一下就没了”
+          const tempMsg = messages.value.find(m => m.id === tempAssistantMessage.id)
+          if (tempMsg && !tempMsg.content) {
+            tempMsg.content = '[错误] 流式响应失败，请重试'
+          }
           throw error
         }
       } catch (error) {

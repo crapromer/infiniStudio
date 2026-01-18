@@ -17,7 +17,7 @@ import requests
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 DATABASE = os.path.join(os.path.dirname(__file__), '..', 'datasets', 'infini.db')
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads')
@@ -1209,8 +1209,11 @@ def chat_completions(service_id):
             return jsonify({'error': 'Server not found'}), 404
         
         # 构建目标URL
+        # 改为统一走目标服务器的 service_agent（agent_port，默认8888）做代理，
+        # 这样推理服务端口可以动态分配，避免 8889/8000 等端口冲突。
         server_ip = server['host_ip']
-        target_url = f"http://{server_ip}:8000/chat/completions"
+        agent_port = server.get('agent_port', 8888)
+        target_url = f"http://{server_ip}:{agent_port}/service/{service_id}/chat/completions"
         
         # 获取请求数据
         request_data = request.json or {}
@@ -1220,29 +1223,49 @@ def chat_completions(service_id):
             request_data['model'] = 'jiuge'
         
         # 转发请求到目标服务器
+        # 注意：流式场景需要显式声明 Accept: text/event-stream，且下游/中间层可能会缓冲
+        is_stream = bool(request_data.get('stream', False))
+        headers = {'Content-Type': 'application/json'}
+        if is_stream:
+            headers['Accept'] = 'text/event-stream'
+            headers['Cache-Control'] = 'no-cache'
+            headers['Accept-Encoding'] = 'identity'
+
         response = requests.post(
             target_url,
             json=request_data,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
             timeout=120,
-            stream=request_data.get('stream', False)
+            stream=is_stream
         )
         
         # 如果是流式响应，需要特殊处理
-        if request_data.get('stream', False):
-            from flask import Response
+        if is_stream:
+            # 关键点：不要用 iter_lines 重新组装SSE（容易被缓冲/换行影响）
+            # 直接把上游推理服务的 bytes 原样转发给前端，保证前端能持续读到增量数据块
+            from flask import Response, stream_with_context
+
             def generate():
-                for line in response.iter_lines():
-                    if line:
-                        # 确保每一行都以 data: 开头（SSE格式）
-                        line_str = line.decode('utf-8', errors='ignore')
-                        if not line_str.startswith('data: '):
-                            yield f'data: {line_str}\n\n'.encode('utf-8')
-                        else:
-                            yield f'{line_str}\n\n'.encode('utf-8')
+                try:
+                    for chunk in response.iter_content(chunk_size=None):
+                        if chunk:
+                            yield chunk
+                except Exception as e:
+                    print(f'流式响应错误: {e}')
+                    import traceback
+                    traceback.print_exc()
+                    error_data = json.dumps({"error": str(e)}, ensure_ascii=False)
+                    yield f'data: {error_data}\n\n'.encode('utf-8')
+                finally:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+
             return Response(
-                generate(),
+                stream_with_context(generate()),
                 mimetype='text/event-stream',
+                direct_passthrough=True,
                 headers={
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
@@ -1587,5 +1610,5 @@ def handle_disconnect():
         del ssh_connections[session_id]
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, port=5000, host='0.0.0.0')
+    socketio.run(app, debug=True, port=5000, host='0.0.0.0', allow_unsafe_werkzeug=True)
 

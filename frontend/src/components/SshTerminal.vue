@@ -52,6 +52,23 @@ export default {
     let resizeObserver = null
     let resizeTimer = null
 
+    // 发送终端尺寸到SSH服务器
+    const sendTerminalSize = () => {
+      if (socket.value && connected.value && terminal.value && fitAddon.value) {
+        try {
+          const dimensions = fitAddon.value.proposeDimensions()
+          if (dimensions && dimensions.cols > 0 && dimensions.rows > 0) {
+            socket.value.emit('ssh_resize', {
+              cols: dimensions.cols,
+              rows: dimensions.rows
+            })
+          }
+        } catch (error) {
+          console.warn('Error sending terminal size:', error)
+        }
+      }
+    }
+
     const initTerminal = () => {
       if (!terminalRef.value) return
 
@@ -69,6 +86,9 @@ export default {
         cursorBlink: true,
         fontSize: 14,
         fontFamily: 'Consolas, "Courier New", monospace',
+        scrollback: 1000, // 设置滚动缓冲区大小
+        allowTransparency: false,
+        disableStdin: false,
         theme: {
           background: '#1e1e1e',
           foreground: '#d4d4d4',
@@ -100,7 +120,20 @@ export default {
 
       // 打开终端
       terminal.value.open(terminalRef.value)
-      fitAddon.value.fit()
+
+      // 延迟执行fit，确保DOM完全渲染
+      setTimeout(() => {
+        if (fitAddon.value) {
+          fitAddon.value.fit()
+        }
+      }, 50)
+
+      // 确保初始状态下滚动到底部
+      setTimeout(() => {
+        if (terminal.value) {
+          terminal.value.scrollToBottom()
+        }
+      }, 100)
 
       // 处理终端输入
       terminal.value.onData((data) => {
@@ -119,7 +152,17 @@ export default {
             }
             resizeTimer = setTimeout(() => {
               try {
-                fitAddon.value.fit()
+                if (fitAddon.value && terminal.value) {
+                  fitAddon.value.fit()
+                  // 调整大小后发送新的终端尺寸到SSH服务器
+                  setTimeout(() => {
+                    sendTerminalSize()
+                    // 重新滚动到底部
+                    if (terminal.value) {
+                      terminal.value.scrollToBottom()
+                    }
+                  }, 50)
+                }
               } catch (error) {
                 // 忽略 ResizeObserver 循环警告（这是一个已知的浏览器警告，不影响功能）
                 if (!error.message || !error.message.includes('ResizeObserver')) {
@@ -159,12 +202,32 @@ export default {
         if (terminal.value) {
           terminal.value.clear()
           terminal.value.writeln('SSH连接已建立')
+          // 连接建立后，等待fitAddon完成，然后发送终端尺寸
+          setTimeout(() => {
+            if (fitAddon.value && terminal.value) {
+              fitAddon.value.fit()
+              // 再等待一下确保尺寸计算完成
+              setTimeout(() => {
+                sendTerminalSize()
+                // 滚动到底部
+                if (terminal.value) {
+                  terminal.value.scrollToBottom()
+                }
+              }, 100)
+            }
+          }, 100)
         }
       })
 
       socket.value.on('ssh_output', (data) => {
         if (terminal.value && data.data) {
           terminal.value.write(data.data)
+          // 每次收到输出后自动滚动到底部
+          setTimeout(() => {
+            if (terminal.value) {
+              terminal.value.scrollToBottom()
+            }
+          }, 10)
         }
       })
 
@@ -172,6 +235,12 @@ export default {
         message.error('SSH连接错误: ' + data.error)
         if (terminal.value) {
           terminal.value.writeln('\r\n错误: ' + data.error)
+          // 错误信息后滚动到底部
+          setTimeout(() => {
+            if (terminal.value) {
+              terminal.value.scrollToBottom()
+            }
+          }, 10)
         }
       })
 
@@ -179,6 +248,12 @@ export default {
         connected.value = false
         if (terminal.value) {
           terminal.value.writeln('\r\nSSH连接已断开')
+          // 断开连接后滚动到底部
+          setTimeout(() => {
+            if (terminal.value) {
+              terminal.value.scrollToBottom()
+            }
+          }, 10)
         }
       })
 
@@ -224,6 +299,12 @@ export default {
         } else {
           terminal.value.writeln('\r\n\r\n已断开连接')
         }
+        // 断开连接后滚动到底部
+        setTimeout(() => {
+          if (terminal.value) {
+            terminal.value.scrollToBottom()
+          }
+        }, 10)
       }
     }
 
@@ -351,12 +432,40 @@ export default {
 .terminal-wrapper {
   flex: 1;
   width: 100%;
-  padding: 16px;
   background: #1e1e1e;
   border-radius: 0 0 12px 12px;
   overflow: hidden;
   min-height: 0;
   position: relative;
+  /* 只添加左侧padding，让文字不紧贴左边界，底部保持0确保最下面一行可见 */
+  padding: 0 0 0 16px;
+  box-sizing: border-box;
+}
+
+.terminal-wrapper :deep(.xterm) {
+  height: 100% !important;
+  /* 宽度设置为100%，fitAddon会自动基于实际可用宽度计算 */
+  width: 100% !important;
+  position: relative;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+.terminal-wrapper :deep(.xterm-viewport) {
+  overflow-y: auto !important;
+  scrollbar-width: thin;
+  scrollbar-color: #4a4a4a #1a1a1a;
+  border-radius: 0 0 12px 12px;
+  /* 确保viewport高度正确，完全可见 */
+  height: 100% !important;
+  max-height: 100% !important;
+}
+
+.terminal-wrapper :deep(.xterm-screen) {
+  /* 确保屏幕内容完全可见，不被底部遮挡 */
+  padding-bottom: 0 !important;
+  margin-bottom: 0 !important;
+  height: 100% !important;
 }
 
 ::v-deep .xterm {
@@ -372,6 +481,8 @@ export default {
 ::v-deep .xterm-screen {
   background-color: #1e1e1e !important;
   border-radius: 8px;
+  /* 确保屏幕内容完全可见 */
+  height: 100% !important;
 }
 
 ::v-deep .xterm-cursor-layer {

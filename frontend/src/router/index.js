@@ -56,5 +56,15 @@ const router = createRouter({
   routes
 })
 
+// 路由守卫：确保刷新时路由和菜单状态同步
+router.beforeEach((to, from, next) => {
+  // 如果路由名称不存在且路径不是根路径，重定向到总览页面
+  if (!to.name && to.path !== '/') {
+    next({ name: 'overview', replace: true })
+    return
+  }
+  next()
+})
+
 export default router
 

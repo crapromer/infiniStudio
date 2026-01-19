@@ -86,7 +86,7 @@
 </template>
 
 <script>
-import { ref } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 
 export default {
@@ -94,12 +94,44 @@ export default {
   setup() {
     const router = useRouter()
     const route = useRoute()
-    const selectedKeys = ref([route.name || 'overview'])
+    
+    // 路由名称到菜单key的映射
+    const routeToMenuKey = (routeName) => {
+      const mapping = {
+        'overview': 'overview',
+        'brands': 'brands',
+        'brandDetail': 'brands',
+        'models': 'models',
+        'servers': 'servers',
+        'services': 'services',
+        'serviceChat': 'services',
+        'tasks': 'tasks'
+      }
+      return mapping[routeName] || 'overview'
+    }
+
+    const selectedKeys = ref([routeToMenuKey(route.name)])
+
+    // 监听路由变化，同步更新菜单选中状态
+    watch(() => route.name, (newRouteName) => {
+      if (newRouteName) {
+        const menuKey = routeToMenuKey(newRouteName)
+        selectedKeys.value = [menuKey]
+      }
+    }, { immediate: true })
 
     const handleMenuClick = ({ key }) => {
       router.push({ name: key })
       selectedKeys.value = [key]
     }
+
+    // 初始化时确保路由和菜单状态同步
+    onMounted(() => {
+      const menuKey = routeToMenuKey(route.name)
+      if (selectedKeys.value[0] !== menuKey) {
+        selectedKeys.value = [menuKey]
+      }
+    })
 
     return {
       selectedKeys,

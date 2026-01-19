@@ -686,12 +686,16 @@ def update_service_status(service_id):
         if not service:
             return
 
-        # 如果状态是启动中或关闭中，不更新（保持当前状态）
         current_status = service.get('deploy_status')
-        if current_status in ['启动中', '关闭中']:
-            return
-
         server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
+        
+        # 如果状态是启动中，不更新（保持当前状态，等待启动完成）
+        if current_status == '启动中':
+            return
+        
+        # 如果状态是关闭中，仍然需要检查agent是否真的存在
+        # 如果agent进程已被杀死，应该更新为离线状态
+        # 如果agent存在但服务已停止，应该更新为在线状态
         if not server_ids:
             # 没有服务器，状态为离线
             conn = get_db()
@@ -755,29 +759,28 @@ def execute_ssh_command(server, command):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(server['host_ip'], port=server['port'], 
+        ssh.connect(server['host_ip'], port=server['port'],
                    username=server['username'], password=server.get('password'),
                    timeout=30)
-        
-        # 转义命令中的单引号，以便在bash -l -c中使用
-        # 将 ' 替换为 '\'' (结束引号 + 转义的单引号 + 开始引号)
-        escaped_command = command.replace("'", "'\\''")
-        
-        # 使用bash -l -c来执行命令，这样可以加载完整的登录环境
-        # -l 表示登录shell，会加载 ~/.bash_profile, ~/.bashrc 等
-        # 同时使用get_pty=True获取伪终端，这对于某些命令很重要
-        full_command = f"bash -lc '{escaped_command}'"
-        print(full_command)
-        
+
+        # 使用here document创建完整的登录shell环境
+        # bash -l 会加载所有登录环境变量
+        # 使用<< 'EOF' 确保命令中的变量不会被提前展开
+        full_command = f"""bash -l << 'EOF'
+{command}
+EOF"""
+
+        print(f"[DEBUG] 执行SSH命令: {command}")
+
         stdin, stdout, stderr = ssh.exec_command(full_command, get_pty=True)
-        
+
         # 等待命令执行完成
         exit_status = stdout.channel.recv_exit_status()
-        
+
         # 读取所有输出
         output = stdout.read().decode('utf-8', errors='ignore')
         error = stderr.read().decode('utf-8', errors='ignore')
-        
+
         return {
             'success': exit_status == 0,
             'output': output,
@@ -1107,6 +1110,8 @@ def stop_service(service_id):
     def stop_thread():
         all_success = True
         stop_results = []
+        agent_unavailable = False  # 标记agent是否不可用
+        
         for server in servers:
             server_result = {
                 'server_id': server['id'],
@@ -1120,24 +1125,33 @@ def stop_service(service_id):
                 if 'error' in result:
                     server_result['message'] = result['error']
                     all_success = False
+                    # 检查是否是agent不可用的错误
+                    error_msg = result['error'].lower()
+                    if '连接失败' in result['error'] or 'connection' in error_msg or 'timeout' in error_msg or 'refused' in error_msg:
+                        agent_unavailable = True
                 else:
                     server_result['success'] = True
                     server_result['message'] = result.get('message', '停止成功')
             except Exception as e:
                 server_result['message'] = str(e)
                 all_success = False
+                # 检查是否是连接错误（agent进程不存在）
+                error_str = str(e).lower()
+                if 'connection' in error_str or 'timeout' in error_str or 'refused' in error_str or '连接' in str(e):
+                    agent_unavailable = True
             
             stop_results.append(server_result)
         
         # 更新部署状态
         conn = get_db()
         cursor = conn.cursor()
-        status = '在线'  # 停止后，状态设为在线（服务器在线但服务已停止）
+        # 如果agent不可用，状态设为离线；否则设为在线（服务器在线但服务已停止）
+        status = '离线' if agent_unavailable else '在线'
         cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (status, service_id))
         conn.commit()
         conn.close()
 
-        # 停止后立即检查一次状态
+        # 停止后立即检查一次状态（即使agent不可用也检查，确保状态正确）
         update_service_status(service_id)
     
     threading.Thread(target=stop_thread, daemon=True).start()
@@ -1653,6 +1667,21 @@ def handle_ssh_input(data):
         try:
             ssh_connections[session_id]['chan'].send(data['input'])
         except:
+            pass
+
+@socketio.on('ssh_resize')
+def handle_ssh_resize(data):
+    """处理终端尺寸调整"""
+    session_id = request.sid
+    if session_id in ssh_connections:
+        try:
+            chan = ssh_connections[session_id]['chan']
+            cols = data.get('cols', 80)
+            rows = data.get('rows', 24)
+            # 使用paramiko的resize_pty方法调整终端尺寸
+            chan.resize_pty(width=cols, height=rows)
+        except Exception as e:
+            print(f'Error resizing terminal: {e}')
             pass
 
 @socketio.on('ssh_disconnect')

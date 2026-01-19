@@ -71,6 +71,48 @@ export default {
     const inputMessage = ref('')
     const sending = ref(false)
     const chatContainer = ref(null)
+    // 发送给模型的历史窗口大小（只影响“带给模型的上下文”，不影响页面展示的历史）
+    const MAX_HISTORY_MESSAGES_FOR_MODEL = 2
+    // 上下文模式：
+    // - 'single'：单轮对话（只发送当前用户消息，适配当前后端限制）
+    // - 'multi'：多轮对话（发送截断后的历史，后续后端支持后可直接打开）
+    const CHAT_CONTEXT_MODE =
+      (process.env.VUE_APP_CHAT_CONTEXT_MODE || 'single').toLowerCase()
+
+    const sanitizeContent = (text) => {
+      if (!text) return ''
+      // 清理常见的结束符/特殊token，避免被当作 EOS 影响后续生成
+      return String(text)
+        .replace(/<\/s>\s*$/g, '') // 末尾 </s>
+        .replace(/<\|endoftext\|>\s*$/g, '')
+        .replace(/<\|eot_id\|>\s*$/g, '')
+        .trim()
+    }
+
+    const buildModelMessages = (allMessages) => {
+      // 1) 只保留 user/assistant
+      const filtered = (allMessages || [])
+        .filter(m => m && (m.role === 'user' || m.role === 'assistant'))
+        .map(m => ({ role: m.role, content: sanitizeContent(m.content) }))
+        .filter(m => m.content) // 去掉空内容（特别是临时空assistant）
+
+      // 2) 合并连续同角色消息，避免 template 处理异常（连续 user / 连续 assistant）
+      const merged = []
+      for (const m of filtered) {
+        const last = merged[merged.length - 1]
+        if (last && last.role === m.role) {
+          last.content = `${last.content}\n${m.content}`
+        } else {
+          merged.push({ ...m })
+        }
+      }
+
+      // 3) 截断：只取最近 N 条
+      let sliced = merged.slice(-MAX_HISTORY_MESSAGES_FOR_MODEL)
+      // 4) 尽量保证切片从 user 开始（很多 chat template 对开头角色敏感）
+      while (sliced.length > 0 && sliced[0].role !== 'user') sliced = sliced.slice(1)
+      return sliced
+    }
 
     const loadService = async () => {
       try {
@@ -120,11 +162,12 @@ export default {
           content: userMessage
         })
 
-        // 准备消息历史（转换为API格式）
-        const apiMessages = messages.value.map(msg => ({
-          role: msg.role,
-          content: msg.content
-        }))
+        // 准备发给模型的 messages
+        // 当前后端不支持多轮：默认只发送当前用户消息；未来支持后可把 CHAT_CONTEXT_MODE 改成 'multi'
+        const apiMessages =
+          CHAT_CONTEXT_MODE === 'multi'
+            ? buildModelMessages(messages.value)
+            : [{ role: 'user', content: sanitizeContent(userMessage) }]
 
         // 调用大模型API（流式响应）
         const requestData = {

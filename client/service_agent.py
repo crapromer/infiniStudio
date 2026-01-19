@@ -677,8 +677,8 @@ def restart_service(service_id):
         if not command:
             # 如果没有提供命令，使用之前的命令
             command = services[service_id].get('command', '')
-        if not command:
-            return jsonify({'error': '重启命令不能为空'}), 400
+            if not command:
+                return jsonify({'error': '重启命令不能为空'}), 400
         
         # 先停止服务
         stop_service_internal(service_id)

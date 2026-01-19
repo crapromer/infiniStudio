@@ -39,10 +39,47 @@
           </a-tag>
         </template>
         <template v-if="column.key === 'action'">
+          <!-- 编辑按钮始终可用 -->
           <a-button type="link" @click="editService(record)" style="color: #667eea; font-weight: 500; padding: 0 8px">编辑</a-button>
-          <a-button type="link" @click="restartService(record)" style="color: #faad14; font-weight: 500; padding: 0 8px">重启服务</a-button>
-          <a-button type="link" @click="stopService(record)" style="color: #ff4d4f; font-weight: 500; padding: 0 8px">停止服务</a-button>
-          <a-button type="link" @click="enterService(record)" style="color: #52c41a; font-weight: 500; padding: 0 8px">进入服务</a-button>
+
+          <!-- 根据状态显示不同的操作按钮 -->
+          <template v-if="record.deploy_status === '离线'">
+            <!-- 离线状态：所有操作按钮都禁用 -->
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">启动服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">停止服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          </template>
+
+          <template v-else-if="record.deploy_status === '在线'">
+            <!-- 在线状态：可以启动服务 -->
+            <a-button type="link" @click="startService(record)" style="color: #52c41a; font-weight: 500; padding: 0 8px">启动服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">停止服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          </template>
+
+          <template v-else-if="record.deploy_status === '启动中'">
+            <!-- 启动中状态：显示启动中，所有操作按钮禁用 -->
+            <a-button type="link" disabled style="color: #1890ff; font-weight: 500; padding: 0 8px">启动中...</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">停止服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          </template>
+
+          <template v-else-if="record.deploy_status === '服务中'">
+            <!-- 服务中状态：可以重启、停止、完全停止、进入服务 -->
+            <a-button type="link" @click="restartService(record)" style="color: #faad14; font-weight: 500; padding: 0 8px">重启服务</a-button>
+            <a-button type="link" @click="stopService(record)" style="color: #ff4d4f; font-weight: 500; padding: 0 8px">停止服务</a-button>
+            <a-button type="link" @click="stopServiceAgent(record)" style="color: #cf1322; font-weight: 500; padding: 0 8px">完全停止</a-button>
+            <a-button type="link" @click="enterService(record)" style="color: #52c41a; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          </template>
+
+          <template v-else-if="record.deploy_status === '关闭中'">
+            <!-- 关闭中状态：显示关闭中，所有操作按钮禁用 -->
+            <a-button type="link" disabled style="color: #fa8c16; font-weight: 500; padding: 0 8px">关闭中...</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">停止服务</a-button>
+            <a-button type="link" disabled style="color: #d9d9d9; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          </template>
+
+          <!-- 删除按钮始终可用 -->
           <a-popconfirm title="确定删除这个服务吗？" @confirm="deleteService(record.id)">
             <a-button type="link" danger style="font-weight: 500; padding: 0 8px">删除</a-button>
           </a-popconfirm>
@@ -134,6 +171,20 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { getServices, refreshServicesStatus, getModels, getServers, createService, updateService, deleteService as deleteServiceApi, restartService as restartServiceApi, stopService as stopServiceApi, getDeployLog } from '../api'
+
+// 停止服务代理的API调用
+const stopServiceAgent = async (serviceId) => {
+  const response = await fetch(`/api/services/${serviceId}/stop-agent`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  })
+  if (!response.ok) {
+    throw new Error('停止服务代理失败')
+  }
+  return response.json()
+}
 import { message } from 'ant-design-vue'
 
 export default {
@@ -166,20 +217,22 @@ export default {
     
     const getDeployStatusColor = (status) => {
       const colors = {
-        'offline': 'default',
-        'online': 'blue',
-        'deploying': 'processing',
-        'deployed': 'success'
+        '离线': 'default',
+        '在线': 'blue',
+        '启动中': 'processing',
+        '服务中': 'success',
+        '关闭中': 'warning'
       }
       return colors[status] || 'default'
     }
-    
+
     const getDeployStatusText = (status) => {
       const texts = {
-        'offline': '离线',
-        'online': '在线',
-        'deploying': '部署中',
-        'deployed': '已部署'
+        '离线': '离线',
+        '在线': '在线',
+        '启动中': '启动中',
+        '服务中': '服务中',
+        '关闭中': '关闭中'
       }
       return texts[status] || status
     }
@@ -190,8 +243,8 @@ export default {
         const servicesRes = await refreshServicesStatus()
         services.value = servicesRes.data
         message.success('状态刷新成功')
-        
-        // 检查是否有部署失败的服务，弹出错误信息
+
+        // 检查是否有操作失败的服务，弹出错误信息
         services.value.forEach(service => {
           if (service.deploy_result) {
             try {
@@ -214,7 +267,7 @@ export default {
                       } else if (s.message) {
                         msg += s.message
                       } else {
-                        msg += '部署失败'
+                        msg += '操作失败'
                       }
                       return msg
                     }).join('\n')
@@ -248,8 +301,8 @@ export default {
         services.value = servicesRes.data
         models.value = modelsRes.data
         servers.value = serversRes.data
-        
-        // 检查是否有部署失败的服务，弹出错误信息
+
+        // 检查是否有操作失败的服务，弹出错误信息
         services.value.forEach(service => {
           if (service.deploy_result) {
             try {
@@ -272,7 +325,7 @@ export default {
                       } else if (s.message) {
                         msg += s.message
                       } else {
-                        msg += '部署失败'
+                        msg += '操作失败'
                       }
                       return msg
                     }).join('\n')
@@ -334,6 +387,8 @@ export default {
           serviceId = res.data.id
         }
         modalVisible.value = false
+        // 创建/编辑服务后立即刷新状态
+        await refreshStatus()
         loadData()
       } catch (error) {
         message.error('操作失败')
@@ -348,9 +403,29 @@ export default {
       try {
         await deleteServiceApi(id)
         message.success('删除成功')
+        await refreshStatus()
         loadData()
       } catch (error) {
         message.error('删除失败')
+      }
+    }
+
+    const startService = async (service) => {
+      try {
+        await restartServiceApi(service.id)  // 使用重启接口来启动服务
+        message.success('启动服务已开始')
+        // 等待500ms确保后端状态已更新，然后刷新状态
+        setTimeout(async () => {
+          await refreshStatus()
+          // 再延迟刷新一次确保状态稳定
+          setTimeout(() => {
+            refreshStatus()
+          }, 2000)
+        }, 500)
+      } catch (error) {
+        message.error('启动服务失败')
+        // 失败时也刷新状态
+        await refreshStatus()
       }
     }
 
@@ -358,12 +433,18 @@ export default {
       try {
         await restartServiceApi(service.id)
         message.success('重启服务已启动')
-        // 延迟一下再刷新数据，以便显示状态变化
-        setTimeout(() => {
-          loadData()
-        }, 1000)
+        // 等待500ms确保后端状态已更新，然后刷新状态
+        setTimeout(async () => {
+          await refreshStatus()
+          // 再延迟刷新一次确保状态稳定
+          setTimeout(() => {
+            refreshStatus()
+          }, 2000)
+        }, 500)
       } catch (error) {
         message.error('重启服务失败')
+        // 失败时也刷新状态
+        await refreshStatus()
       }
     }
 
@@ -371,12 +452,35 @@ export default {
       try {
         await stopServiceApi(service.id)
         message.success('停止服务已启动')
-        // 延迟一下再刷新数据，以便显示状态变化
-        setTimeout(() => {
-          loadData()
-        }, 1000)
+        // 等待500ms确保后端状态已更新，然后刷新状态
+        setTimeout(async () => {
+          await refreshStatus()
+          // 再延迟刷新一次确保状态稳定
+          setTimeout(() => {
+            refreshStatus()
+          }, 2000)
+        }, 500)
       } catch (error) {
         message.error('停止服务失败')
+        // 失败时也刷新状态
+        await refreshStatus()
+      }
+    }
+
+    const stopServiceAgent = async (service) => {
+      try {
+        await stopServiceAgent(service.id)
+        message.success('完全停止服务代理已启动')
+        // 立即刷新状态
+        await refreshStatus()
+        // 由于agent会退出，可能需要更长的延迟来确认状态
+        setTimeout(() => {
+          refreshStatus()
+        }, 3000)
+      } catch (error) {
+        message.error('完全停止服务代理失败')
+        // 失败时也刷新状态
+        await refreshStatus()
       }
     }
 
@@ -413,8 +517,10 @@ export default {
       handleSubmit,
       handleCancel,
       deleteService,
+      startService,
       restartService,
       stopService,
+      stopServiceAgent,
       refreshStatus,
       viewDeployLog,
       enterService,

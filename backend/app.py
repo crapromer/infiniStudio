@@ -675,54 +675,60 @@ def call_service_agent(server, endpoint, method='GET', data=None, timeout=30):
         return {'error': str(e)}
 
 def update_service_status(service_id):
-    """更新服务状态：offline、online、deploying、deployed"""
+    """更新服务状态：离线、在线、启动中、服务中、关闭中"""
     try:
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM services WHERE id = ?', (service_id,))
         service = dict(cursor.fetchone())
         conn.close()
-        
+
         if not service:
             return
-        
-        # 如果状态是deploying，不更新（保持部署中状态）
-        if service.get('deploy_status') == 'deploying':
+
+        # 如果状态是启动中或关闭中，不更新（保持当前状态）
+        current_status = service.get('deploy_status')
+        if current_status in ['启动中', '关闭中']:
             return
-        
+
         server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
         if not server_ids:
-            # 没有服务器，状态为offline
+            # 没有服务器，状态为离线
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('offline', service_id))
+            cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('离线', service_id))
             conn.commit()
             conn.close()
             return
-        
+
         # 获取第一个服务器的状态（简化处理，实际可以聚合多个服务器状态）
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM servers WHERE id = ?', (server_ids[0],))
         server = dict(cursor.fetchone())
         conn.close()
-        
-        # 调用客户端接口获取状态
-        result = call_service_agent(server, f'/service/{service_id}/status', 'GET', timeout=5)
-        
-        if 'error' in result:
-            # 连接失败，状态为offline
-            db_status = 'offline'
+
+        # 先检查服务器本身是否在线
+        server_online = ping_host(server['host_ip'])
+
+        if not server_online:
+            # 服务器离线
+            db_status = '离线'
         else:
-            # 根据状态更新数据库
-            agent_status = result.get('status', 'stopped')
-            # 映射客户端状态到数据库状态
-            # running -> deployed, stopped -> online（服务器在线但服务未运行）
-            if agent_status == 'running':
-                db_status = 'deployed'
+            # 服务器在线，检查服务状态
+            result = call_service_agent(server, f'/service/{service_id}/status', 'GET', timeout=5)
+
+            if 'error' in result:
+                # 无法访问agent服务，状态为离线
+                db_status = '离线'
             else:
-                db_status = 'online'  # 服务器在线但服务未运行
-        
+                # 根据agent返回的状态映射
+                agent_status = result.get('status', 'stopped')
+                if agent_status == 'running':
+                    db_status = '服务中'  # 服务正在运行
+                else:
+                    db_status = '在线'  # 服务器在线但服务未运行
+
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (db_status, service_id))
@@ -730,11 +736,11 @@ def update_service_status(service_id):
         conn.close()
     except Exception as e:
         print(f'Error updating service status: {e}')
-        # 出错时设为offline
+        # 出错时设为离线
         try:
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('offline', service_id))
+            cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('离线', service_id))
             conn.commit()
             conn.close()
         except:
@@ -792,10 +798,10 @@ def execute_ssh_command(server, command):
 def deploy_service_thread(service_id, server_ids, deploy_command):
     """在后台线程中执行部署命令"""
     try:
-        # 更新状态为部署中
+        # 更新状态为启动中
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('deploying', service_id))
+        cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('启动中', service_id))
         conn.commit()
         conn.close()
         
@@ -840,22 +846,27 @@ def deploy_service_thread(service_id, server_ids, deploy_command):
         # 更新部署状态和结果
         conn = get_db()
         cursor = conn.cursor()
-        # 部署完成后，状态会根据实际运行情况自动更新为deployed或online
-        # 这里先设置为online，后续通过状态检查自动更新
-        status = 'online'  # 部署完成，等待状态检查更新
+        # 部署完成后，根据部署结果设置状态
+        all_success = all(result.get('success', False) for result in deploy_results)
+        if all_success:
+            # 部署成功，设置为服务中（等待状态检查确认）
+            status = '服务中'
+        else:
+            # 部署失败，设置为在线（服务器在线但服务部署失败）
+            status = '在线'
         result_json = json.dumps(deploy_results, ensure_ascii=False)
-        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?', 
+        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?',
                       (status, result_json, service_id))
         conn.commit()
         conn.close()
-        
+
         # 部署完成后立即检查一次状态
         update_service_status(service_id)
     except Exception as e:
-        # 部署失败，设为offline
+        # 部署失败，设为离线
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('offline', service_id))
+        cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('离线', service_id))
         conn.commit()
         conn.close()
 
@@ -941,7 +952,7 @@ def create_service():
     cursor.execute('''
         INSERT INTO services (name, model_id, server_ids, deploy_command, deploy_status)
         VALUES (?, ?, ?, ?, ?)
-    ''', (data['name'], data['model_id'], server_ids, deploy_command, 'offline'))
+    ''', (data['name'], data['model_id'], server_ids, deploy_command, '离线'))
     conn.commit()
     service_id = cursor.lastrowid
     conn.close()
@@ -974,14 +985,21 @@ def restart_service(service_id):
     cursor.execute('SELECT * FROM services WHERE id = ?', (service_id,))
     service = dict(cursor.fetchone())
     conn.close()
-    
+
     if not service:
         return jsonify({'error': 'Service not found'}), 404
-    
+
     server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
     if not server_ids:
         return jsonify({'error': 'No servers associated with this service'}), 400
-    
+
+    # 在开始重启前立即设置状态为启动中
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('启动中', service_id))
+    conn.commit()
+    conn.close()
+
     # 获取服务器信息
     conn = get_db()
     cursor = conn.cursor()
@@ -991,7 +1009,7 @@ def restart_service(service_id):
         server = dict(cursor.fetchone())
         servers.append(server)
     conn.close()
-    
+
     # 执行重启命令（使用部署命令，但添加重启逻辑）
     # 这里假设重启命令就是在部署命令前添加重启逻辑，或者使用相同的命令
     # 实际使用中，可以添加专门的重启命令字段，这里简化处理使用部署命令
@@ -1031,14 +1049,20 @@ def restart_service(service_id):
         # 更新部署状态和结果
         conn = get_db()
         cursor = conn.cursor()
-        # 重启完成后，状态设为online，错误信息保存在deploy_result中
-        status = 'online'  # 重启完成，等待状态检查更新
+        # 重启完成后，根据重启结果设置状态
+        all_success = all(result.get('success', False) for result in deploy_results)
+        if all_success:
+            # 重启成功，设置为服务中（等待状态检查确认）
+            status = '服务中'
+        else:
+            # 重启失败，设置为在线（服务器在线但服务重启失败）
+            status = '在线'
         result_json = json.dumps(deploy_results, ensure_ascii=False)
-        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?', 
+        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?',
                       (status, result_json, service_id))
         conn.commit()
         conn.close()
-        
+
         # 重启完成后立即检查一次状态
         update_service_status(service_id)
     
@@ -1072,6 +1096,13 @@ def stop_service(service_id):
         servers.append(server)
     conn.close()
     
+    # 设置状态为关闭中
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('关闭中', service_id))
+    conn.commit()
+    conn.close()
+
     # 在后台线程中执行停止
     def stop_thread():
         all_success = True
@@ -1101,17 +1132,83 @@ def stop_service(service_id):
         # 更新部署状态
         conn = get_db()
         cursor = conn.cursor()
-        status = 'online'  # 停止后，状态设为online（服务器在线但服务未运行）
+        status = '在线'  # 停止后，状态设为在线（服务器在线但服务已停止）
         cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (status, service_id))
         conn.commit()
         conn.close()
-        
+
         # 停止后立即检查一次状态
         update_service_status(service_id)
     
     threading.Thread(target=stop_thread, daemon=True).start()
-    
+
     return jsonify({'message': 'Service stop initiated'})
+
+
+@app.route('/api/services/<int:service_id>/stop-agent', methods=['POST'])
+def stop_service_agent(service_id):
+    """完全停止服务代理"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM services WHERE id = ?', (service_id,))
+    service = dict(cursor.fetchone())
+    conn.close()
+
+    if not service:
+        return jsonify({'error': 'Service not found'}), 404
+
+    server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
+    if not server_ids:
+        return jsonify({'error': 'No servers associated with this service'}), 400
+
+    # 获取第一个服务器的信息
+    conn = get_db()
+    cursor = conn.cursor()
+    servers = []
+    for server_id in server_ids:
+        cursor.execute('SELECT * FROM servers WHERE id = ?', (server_id,))
+        server = dict(cursor.fetchone())
+        servers.append(server)
+    conn.close()
+
+    # 在后台线程中执行完全停止
+    def stop_agent_thread():
+        all_success = True
+        stop_results = []
+        for server in servers:
+            server_result = {
+                'server_id': server['id'],
+                'server_name': server['name'],
+                'server_ip': server['host_ip'],
+                'success': False,
+                'message': ''
+            }
+            try:
+                # 调用agent的stop-agent接口
+                result = call_service_agent(server, f'/service/{service_id}/stop-agent', 'POST')
+                if 'error' in result:
+                    server_result['message'] = result['error']
+                    all_success = False
+                else:
+                    server_result['success'] = True
+                    server_result['message'] = result.get('message', '代理停止成功')
+            except Exception as e:
+                server_result['message'] = str(e)
+                all_success = False
+
+            stop_results.append(server_result)
+
+        # 更新服务状态为离线
+        conn = get_db()
+        cursor = conn.cursor()
+        status = '离线'  # 代理停止后，状态设为离线
+        cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (status, service_id))
+        conn.commit()
+        conn.close()
+
+    threading.Thread(target=stop_agent_thread, daemon=True).start()
+
+    return jsonify({'message': 'Service agent stop initiated'})
 
 @app.route('/api/services/<int:service_id>/deploy-log', methods=['GET'])
 def get_deploy_log(service_id):

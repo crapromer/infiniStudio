@@ -17,34 +17,25 @@ import socket
 from datetime import datetime
 import json
 import argparse
-import queue
 import uuid
-import contextlib
 import requests
 
-# 推理服务相关导入（可选，如果模块不存在会失败）
+# 推理服务相关导入（新版：参考 inference_server.py，进程内直接调用 InferEngine）
 try:
-    from jiuge import JiugeForCauslLM
-    from jiuge_awq import JiugeAWQForCausalLM
-    from libinfinicore_infer import DeviceType
-    from infer_task import InferTask
-    from kvcache_pool import KVCachePool
+    import infinicore
+    from infinilm.core.scheduler import Scheduler
+    from infinilm.core.request import RequestStatus, InferenceRequest
+    from infinilm.distributed import DistConfig
+    from infinilm.infer_engine import InferEngine
+    from transformers import AutoTokenizer
+    from tokenizers import decoders as _dec
+    from infinilm.cache.cache import PagedKVCacheConfig
+    from infinilm.modeling_utils import load_model_state_dict_by_file
     INFERENCE_AVAILABLE = True
 except ImportError as e:
-    print(f"[WARNING] 推理服务模块未找到: {e}")
+    print(f"[WARNING] 推理依赖未找到: {e}")
     print("[WARNING] 将回退到子进程模式启动服务")
     INFERENCE_AVAILABLE = False
-
-# FastAPI相关导入
-try:
-    from fastapi import FastAPI as FastAPIApp, Request
-    from fastapi.responses import StreamingResponse as FastAPIStreamingResponse, JSONResponse as FastAPIJSONResponse
-    import uvicorn
-    import janus
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    print("[WARNING] FastAPI/uvicorn未安装，推理服务功能将不可用")
-    FASTAPI_AVAILABLE = False
 
 def get_env_with_path():
     """获取包含PATH的环境变量字典"""
@@ -67,34 +58,15 @@ def get_env_with_path():
 
 app = Flask(__name__)
 
-# 设备类型映射
-if INFERENCE_AVAILABLE:
-    DEVICE_TYPE_MAP = {
-        "cpu": DeviceType.DEVICE_TYPE_CPU,
-        "nvidia": DeviceType.DEVICE_TYPE_NVIDIA,
-        "qy": DeviceType.DEVICE_TYPE_QY,
-        "cambricon": DeviceType.DEVICE_TYPE_CAMBRICON,
-        "ascend": DeviceType.DEVICE_TYPE_ASCEND,
-        "metax": DeviceType.DEVICE_TYPE_METAX,
-        "moore": DeviceType.DEVICE_TYPE_MOORE,
-        "iluvatar": DeviceType.DEVICE_TYPE_ILUVATAR,
-        "kunlun": DeviceType.DEVICE_TYPE_KUNLUN,
-        "hygon": DeviceType.DEVICE_TYPE_HYGON,
-    }
-else:
-    DEVICE_TYPE_MAP = {}
-
 # 存储服务进程信息
 # {service_id: {
 #     'process': subprocess.Popen or None,
-#     'inference_app': FastAPI app or None,
-#     'uvicorn_server': uvicorn.Server or None,
-#     'inference_thread': Thread or None,
+#     'runtime': dict or None,  # 进程内推理运行时资源
+#     'runtime_lock': threading.Lock,
 #     'command': str,
 #     'config': dict,  # 推理服务配置
 #     'status': str,
 #     'start_time': datetime,
-#     'port': int  # 推理服务端口
 # }}
 services = {}
 
@@ -141,14 +113,21 @@ def parse_deploy_command(command):
     while i < len(parts):
         part = parts[i]
         if part.startswith('--'):
-            key = part[2:].replace('-', '_')
-            if i + 1 < len(parts) and not parts[i + 1].startswith('--'):
-                args_dict[key] = parts[i + 1]
-                i += 2
-            else:
-                # 布尔标志
-                args_dict[key] = True
+            # 支持 --key=value
+            if '=' in part:
+                k, v = part[2:].split('=', 1)
+                key = k.replace('-', '_')
+                args_dict[key] = v
                 i += 1
+            else:
+                key = part[2:].replace('-', '_')
+                if i + 1 < len(parts) and (not parts[i + 1].startswith('--')):
+                    args_dict[key] = parts[i + 1]
+                    i += 2
+                else:
+                    # 布尔标志
+                    args_dict[key] = True
+                    i += 1
         elif part == 'python' or part.endswith('.py'):
             # 跳过python和脚本名
             i += 1
@@ -161,20 +140,368 @@ def parse_deploy_command(command):
 def parse_config_from_command(command):
     """从命令中解析配置参数"""
     config = parse_deploy_command(command)
-    
-    # 设置默认值
-    result = {
-        'model_path': config.get('model_path') or config.get('model-path', ''),
-        'dev': config.get('dev', 'cpu'),
-        'ndev': int(config.get('ndev', 1)),
-        'max_batch': int(config.get('max_batch') or config.get('max-batch', 3)),
-        'max_tokens': int(config.get('max_tokens') or config.get('max-tokens')) if config.get('max_tokens') or config.get('max-tokens') else None,
-        'awq': config.get('awq', False),
-        # port 可选：如果命令未指定，则后续动态分配，避免端口冲突
-        'port': int(config.get('port')) if config.get('port') else None
+
+    # 兼容旧字段/新字段
+    model_path = config.get('model_path') or config.get('model-path') or ''
+
+    # device flags（inference_server.py 的 CLI 风格：--cpu/--nvidia/...）
+    device_flag = 'cpu'
+    if config.get('nvidia'):
+        device_flag = 'cuda'
+    elif config.get('metax'):
+        device_flag = 'cuda'
+    elif config.get('iluvatar'):
+        device_flag = 'cuda'
+    elif config.get('moore'):
+        device_flag = 'moore'
+    elif config.get('cambricon'):
+        device_flag = 'mlu'
+    elif config.get('cpu'):
+        device_flag = 'cpu'
+
+    # tp（张量并行）/ndev 兼容
+    tp = config.get('tp') or config.get('ndev') or 1
+    try:
+        tp = int(tp)
+    except Exception:
+        tp = 1
+
+    # max_tokens / max_batch_size
+    max_tokens = config.get('max_tokens') or config.get('max-tokens') or config.get('max_tokens'.replace('-', '_'))
+    try:
+        max_tokens = int(max_tokens) if max_tokens is not None else 512
+    except Exception:
+        max_tokens = 512
+
+    max_batch_size = (
+        config.get('max_batch_size')
+        or config.get('max-batch-size')
+        or config.get('max_batch')
+        or config.get('max-batch')
+        or 8
+    )
+    try:
+        max_batch_size = int(max_batch_size)
+    except Exception:
+        max_batch_size = 8
+
+    # backend / dtype / sampling
+    backend = config.get('backend') or 'cpp'
+    dtype = config.get('dtype') or 'float16'
+    temperature = config.get('temperature') or 1.0
+    top_p = config.get('top_p') or config.get('top-p') or 0.8
+    top_k = config.get('top_k') or config.get('top-k') or 1
+    num_blocks = config.get('num_blocks') or config.get('num-blocks') or 8 * 1024
+    block_size = config.get('block_size') or config.get('block-size') or 16
+
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 1.0
+    try:
+        top_p = float(top_p)
+    except Exception:
+        top_p = 0.8
+    try:
+        top_k = int(top_k)
+    except Exception:
+        top_k = 1
+    try:
+        num_blocks = int(num_blocks)
+    except Exception:
+        num_blocks = 8 * 1024
+    try:
+        block_size = int(block_size)
+    except Exception:
+        block_size = 16
+
+    # port 可选：如果命令未指定，则后续动态分配，避免端口冲突
+    port = None
+    if config.get('port'):
+        try:
+            port = int(config.get('port'))
+        except Exception:
+            port = None
+
+    return {
+        'model_path': model_path,
+        'device': device_flag,           # 'cpu' | 'cuda' | 'moore' | 'mlu'
+        'dtype': dtype,                  # 'float16' | 'float32' | 'bfloat16'
+        'tp': tp,                        # tensor parallel
+        'max_tokens': max_tokens,
+        'max_batch_size': max_batch_size,
+        'backend': backend,              # 'cpp' | 'python'
+        'num_blocks': num_blocks,
+        'block_size': block_size,
+        'temperature': temperature,
+        'top_p': top_p,
+        'top_k': top_k,
+        'port': port,
     }
-    
-    return result
+
+
+def _build_runtime(service_id: str, config: dict) -> dict:
+    """
+    进程内构建推理运行时（参考 inference_server.py 的 lifespan 初始化逻辑）
+    注意：不启动独立 HTTP 推理服务，不使用 uvicorn 线程。
+    """
+    model_path = config.get("model_path") or ""
+    if not model_path:
+        raise RuntimeError("model_path 不能为空")
+
+    device_str = config.get("device") or "cpu"
+    infini_device = infinicore.device(device_str, 0)
+
+    dtype_str = (config.get("dtype") or "float16").lower()
+    if dtype_str == "float32":
+        infini_dtype = infinicore.float32
+    elif dtype_str == "bfloat16":
+        infini_dtype = infinicore.bfloat16
+    else:
+        infini_dtype = infinicore.float16
+
+    tp = int(config.get("tp") or 1)
+    max_tokens = int(config.get("max_tokens") or 512)
+    max_batch_size = int(config.get("max_batch_size") or 8)
+    backend = config.get("backend") or "cpp"
+    num_blocks = int(config.get("num_blocks") or (8 * 1024))
+    block_size = int(config.get("block_size") or 16)
+
+    temperature = float(config.get("temperature") or 1.0)
+    top_p = float(config.get("top_p") or 0.8)
+    top_k = int(config.get("top_k") or 1)
+
+    print(
+        f"[INFO] 初始化推理运行时: service_id={service_id}, model_path={model_path}, device={device_str}, "
+        f"dtype={dtype_str}, tp={tp}, backend={backend}"
+    )
+
+    engine = InferEngine(
+        model_path=model_path,
+        device=infini_device,
+        distributed_config=DistConfig(tp),
+    )
+    load_model_state_dict_by_file(engine, model_path, dtype=engine.config.dtype)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    # llama decoder 修复（与 inference_server.py 保持一致）
+    try:
+        if "llama" in engine.config.model_type:
+            backend_tok = getattr(tokenizer, "backend_tokenizer", None)
+            target = getattr(backend_tok, "_tokenizer", backend_tok)
+            norm = getattr(target, "normalizer", None)
+            dec = getattr(target, "decoder", None)
+            sn = repr(norm)[:800] if norm is not None else ""
+            sd = repr(dec)[:800] if dec is not None else ""
+            has_prepend = "Prepend" in sn
+            has_strip = "Strip" in sd
+            if has_prepend and has_strip:
+                target.decoder = _dec.Sequence(
+                    [
+                        _dec.Replace("▁", " "),
+                        _dec.ByteFallback(),
+                        _dec.Fuse(),
+                    ]
+                )
+    except Exception as e:
+        print(f"[WARNING] llama decoder patch 失败: {e}")
+
+    cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
+    engine.reset_cache(cache_config)
+
+    scheduler = Scheduler(
+        max_batch_size=max_batch_size,
+        num_blocks=num_blocks,
+        block_size=block_size,
+    )
+
+    return {
+        "engine": engine,
+        "tokenizer": tokenizer,
+        "scheduler": scheduler,
+        "config": {
+            **config,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+        },
+    }
+
+
+def _check_request_finished(req, token_id) -> bool:
+    """参考 inference_server.py:_check_request_finished"""
+    # Check max length
+    if req.get_num_generated_tokens() >= req.max_new_tokens:
+        req.finish_reason = "length"
+        return True
+    # Check EOS token
+    if req.eos_token_id and token_id in req.eos_token_id:
+        req.finish_reason = "eos_token"
+        return True
+    # Check end strings
+    for end_str in getattr(req, "end_strings", []) or []:
+        if req.generated_text.endswith(end_str):
+            req.finish_reason = "end_string"
+            return True
+    return False
+
+
+def _to_infinicore_inputs(model_input_dict: dict) -> dict:
+    """参考 inference_server.py:_step_loop 里对 model_input_dict 的转换"""
+    model_input = {}
+    for key, value in model_input_dict.items():
+        if key == "input_ids":
+            model_input[key] = infinicore.from_list([value], dtype=infinicore.int64)
+        elif key in [
+            "position_ids",
+            "past_kv_lengths",
+            "total_kv_lengths",
+            "input_offsets",
+            "slot_mapping",
+        ]:
+            model_input[key] = infinicore.from_list(value, dtype=infinicore.int64)
+        elif key == "block_tables":
+            model_input[key] = infinicore.from_list(value, dtype=infinicore.int64)
+        else:
+            model_input[key] = value
+    return model_input
+
+
+def _infer_stream(runtime: dict, request_data: dict):
+    """单请求流式推理：不依赖后台线程，边 step 边 SSE 输出"""
+    cfg = runtime["config"]
+    engine = runtime["engine"]
+    tokenizer = runtime["tokenizer"]
+    scheduler = runtime["scheduler"]
+
+    messages = request_data.get("messages", [])
+    input_content = tokenizer.apply_chat_template(
+        conversation=messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    input_tokens = tokenizer.encode(input_content)
+
+    req_id = f"cmpl-{uuid.uuid4().hex}"
+    req = InferenceRequest(
+        req_id,
+        request_data,
+        None,  # FastAPI Request 不可用，传 None（仅用于断连检查/日志）
+        input_tokens,
+        request_data.get("max_tokens", cfg.get("max_tokens", 512)),
+        request_data.get("temperature", cfg.get("temperature", 1.0)),
+        request_data.get("top_k", cfg.get("top_k", 1)),
+        request_data.get("top_p", cfg.get("top_p", 0.8)),
+        engine.config.eos_token_id,
+    )
+
+    scheduler.add_request(req)
+
+    # 初始空 chunk（与 OpenAI 兼容）
+    first = json.dumps(chunk_json(req_id, content="", role="assistant"), ensure_ascii=False)
+    yield f"data: {first}\n\n".encode("utf-8")
+
+    start_time = time.time()
+    # 同步 step loop（不启独立线程）
+    while True:
+        # 超时保护
+        if time.time() - start_time > 1000.0:
+            req.status = RequestStatus.Timeout
+            req.finish_reason = "timeout"
+            err_chunk = json.dumps(
+                chunk_json(req_id, content="[Request timeout]", finish_reason="timeout"),
+                ensure_ascii=False,
+            )
+            yield f"data: {err_chunk}\n\n".encode("utf-8")
+            break
+
+        if req.finish_reason is not None:
+            end_chunk = json.dumps(chunk_json(req_id, finish_reason=req.finish_reason), ensure_ascii=False)
+            yield f"data: {end_chunk}\n\n".encode("utf-8")
+            break
+
+        scheduler_output = scheduler.schedule()
+        if scheduler_output is None:
+            time.sleep(0.01)
+            continue
+        if not getattr(scheduler_output, "scheduled_requests", []):
+            time.sleep(0.01)
+            continue
+
+        # Build model inputs
+        model_input_dict = scheduler_output.build_model_inputs(
+            request_data.get("temperature", cfg.get("temperature", 1.0)),
+            request_data.get("top_p", cfg.get("top_p", 0.8)),
+            request_data.get("top_k", cfg.get("top_k", 1)),
+        )
+        model_input = _to_infinicore_inputs(model_input_dict)
+
+        sampled_tokens = engine.forward(**model_input)
+        sampled_tokens_list = sampled_tokens.to_numpy().tolist()
+
+        # prefill 时重置 req blocks（与 inference_server 保持一致）
+        if getattr(scheduler_output, "is_prefill", False):
+            try:
+                scheduler.cache_manager.reset_req_blocks()
+            except Exception:
+                pass
+
+        scheduled = scheduler_output.scheduled_requests
+        for _r, token_id in zip(scheduled, sampled_tokens_list):
+            _r.generated_token_ids.append(token_id)
+            if getattr(_r, "is_prefill", False):
+                _r.is_prefill = False
+
+            token_text = tokenizer.decode(token_id)
+            _r.generated_text += token_text
+
+            if _check_request_finished(_r, token_id):
+                _r.status = RequestStatus.Finished
+                _r.finished_time = time.time()
+
+            # SSE 输出本 token
+            out_chunk = json.dumps(chunk_json(req_id, content=token_text), ensure_ascii=False)
+            yield f"data: {out_chunk}\n\n".encode("utf-8")
+
+        # 通知 scheduler 本 step 完成
+        try:
+            scheduler.complete_requests(scheduled)
+        except Exception:
+            pass
+
+    yield b"data: [DONE]\n\n"
+
+
+def _infer_once(runtime: dict, request_data: dict) -> dict:
+    """非流式推理：同步 step 直到结束，最后返回完整响应"""
+    output_text_parts = []
+    for b in _infer_stream(runtime, {**request_data, "stream": True}):
+        try:
+            s = b.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        # 只拼 content（忽略 [DONE] / finish_reason chunk）
+        if not s.startswith("data: "):
+            continue
+        payload = s[len("data: ") :].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+            choices = (obj or {}).get("choices") or []
+            if choices and isinstance(choices, list):
+                delta = choices[0].get("delta") or {}
+                c = delta.get("content") or choices[0].get("text")
+                if c:
+                    output_text_parts.append(c)
+        except Exception:
+            continue
+
+    full_text = "".join(output_text_parts).strip()
+    rid = f"cmpl-{uuid.uuid4().hex}"
+    return chunk_json(rid, content=full_text, role="assistant", finish_reason="stop")
 
 
 def chunk_json(id_, content=None, role=None, finish_reason=None):
@@ -202,224 +529,44 @@ def chunk_json(id_, content=None, role=None, finish_reason=None):
     }
 
 
-# 推理任务的异步包装类
-if INFERENCE_AVAILABLE and FASTAPI_AVAILABLE:
-    class AsyncInferTask(InferTask):
-        def __init__(self, id, tokens, max_tokens, temperature, topk, topp, end_tokens):
-            super().__init__(id, tokens, max_tokens, temperature, topk, topp, end_tokens)
-            self.output_queue = janus.Queue()
-            print(f"[INFO] Create InferTask {self.id}")
-
-        def output(self, out_token):
-            self.next(out_token)
-            self.output_queue.sync_q.put(out_token)
-
-
-def worker_loop(app_state):
-    """推理工作循环"""
-    MAX_BATCH = app_state.config['max_batch']
-    while not app_state.shutdown_event.is_set():
-        try:
-            task = app_state.request_queue.sync_q.get(timeout=0.01)
-        except queue.Empty:
-            continue
-
-        if task is None:
-            return
-
-        batch = [task]
-        while len(batch) < MAX_BATCH:
-            try:
-                req = app_state.request_queue.sync_q.get_nowait()
-                if req is not None:
-                    batch.append(req)
-            except queue.Empty:
-                break
-        
-        output_tokens = app_state.model.batch_infer_one_round(batch)
-        for task, token in zip(batch, output_tokens):
-            task.output(token)
-            if task.finish_reason is None:
-                app_state.request_queue.sync_q.put(task)
-            else:
-                print(f"[INFO] Task {task.id} finished infer.")
-                app_state.kv_cache_pool.release_sync(task)
-
-
 def build_inference_app(service_id, config):
-    """构建推理服务的FastAPI应用"""
+    """构建推理服务的FastAPI应用（基于 inference_server.InferenceServer）"""
     if not INFERENCE_AVAILABLE or not FASTAPI_AVAILABLE:
         raise RuntimeError("推理服务模块不可用")
-    
-    model_path = config['model_path']
-    device_type = DEVICE_TYPE_MAP.get(config['dev'], DeviceType.DEVICE_TYPE_CPU)
-    ndev = config['ndev']
-    max_tokens = config['max_tokens']
-    USE_AWQ = config['awq']
-    MAX_BATCH = config['max_batch']
-    port = config['port']
-    
-    print(f"[INFO] 启动推理服务: service_id={service_id}, model_path={model_path}, dev={config['dev']}, port={port}")
-    
-    @contextlib.asynccontextmanager
-    async def lifespan(inference_app: FastAPIApp):
-        # Startup
-        if USE_AWQ:
-            inference_app.state.model = JiugeAWQForCausalLM(
-                model_path, device_type, ndev, max_tokens=max_tokens
-            )
-        else:
-            inference_app.state.model = JiugeForCauslLM(
-                model_path, device_type, ndev, max_tokens=max_tokens
-            )
-        inference_app.state.kv_cache_pool = KVCachePool(inference_app.state.model, MAX_BATCH)
-        inference_app.state.request_queue = janus.Queue()
-        inference_app.state.config = config
-        worker_thread = threading.Thread(target=worker_loop, args=(inference_app.state,), daemon=True)
-        worker_thread.start()
-        
-        print(f"[INFO] 推理服务 {service_id} 模型加载完成")
 
-        try:
-            yield  # The app runs here
-        finally:
-            # Shutdown
-            inference_app.state.shutdown_event.set()
-            inference_app.state.request_queue.sync_q.put(None)
-            worker_thread.join(timeout=5)
-            inference_app.state.request_queue.shutdown()
+    model_path = config.get('model_path') or ''
+    if not model_path:
+        raise RuntimeError("model_path 不能为空")
 
-            inference_app.state.kv_cache_pool.finalize()
-            inference_app.state.model.destroy_model_instance()
-            print(f"[INFO] 推理服务 {service_id} 已关闭")
-    
-    # 创建FastAPI应用，设置lifespan
-    inference_app = FastAPIApp(lifespan=lifespan)
-    
-    # 存储配置和资源
-    inference_app.state.config = config
-    inference_app.state.service_id = service_id
-    inference_app.state.shutdown_event = threading.Event()
-    
-    def build_task(id_, request_data, app_state):
-        """构建推理任务"""
-        messages = request_data.get("messages", [])
-        input_content = app_state.model.tokenizer.apply_chat_template(
-            conversation=messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        tokens = app_state.model.tokenizer.encode(input_content)
-        return AsyncInferTask(
-            id_,
-            tokens,
-            request_data.get("max_tokens", app_state.model.max_context_len()),
-            request_data.get("temperature", 1.0),
-            request_data.get("top_k", 1),
-            request_data.get("top_p", 1.0),
-            app_state.model.eos_token_id,
-        )
-    
-    async def chat_stream(id_, request_data, req: Request):
-        """流式聊天接口"""
-        try:
-            infer_task = build_task(id_, request_data, req.app.state)
-            await req.app.state.kv_cache_pool.acquire(infer_task)
+    # device / dtype 映射到 infinicore 对象
+    device_str = config.get('device') or 'cpu'  # 'cpu'|'cuda'|'moore'|'mlu'
+    infini_device = infinicore.device(device_str, 0)
 
-            # 初始空内容
-            chunk = json.dumps(
-                chunk_json(id_, content="", role="assistant"), ensure_ascii=False
-            )
-            yield f"data: {chunk}\n\n"
+    dtype_str = (config.get('dtype') or 'float16').lower()
+    if dtype_str == 'float32':
+        infini_dtype = infinicore.float32
+    elif dtype_str == 'bfloat16':
+        infini_dtype = infinicore.bfloat16
+    else:
+        infini_dtype = infinicore.float16
 
-            req.app.state.request_queue.sync_q.put(infer_task)
+    server_obj = InferenceServer(
+        model_path=model_path,
+        device=infini_device,
+        dtype=infini_dtype,
+        ndev=int(config.get('tp') or 1),
+        max_tokens=int(config.get('max_tokens') or 512),
+        max_batch_size=int(config.get('max_batch_size') or 8),
+        backend=config.get('backend') or 'cpp',
+        num_blocks=int(config.get('num_blocks') or (8 * 1024)),
+        block_size=int(config.get('block_size') or 16),
+        temperature=float(config.get('temperature') or 1.0),
+        top_p=float(config.get('top_p') or 0.8),
+        top_k=int(config.get('top_k') or 1),
+    )
 
-            while True:
-                if await req.is_disconnected():
-                    print("Client disconnected. Aborting stream.")
-                    break
-                if (
-                    infer_task.finish_reason is not None
-                    and infer_task.output_queue.async_q.empty()
-                ):
-                    chunk = json.dumps(
-                        chunk_json(id_, finish_reason=infer_task.finish_reason),
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {chunk}\n\n"
-                    break
-
-                token = await infer_task.output_queue.async_q.get()
-                content = req.app.state.model.tokenizer.decode(token)
-
-                chunk = json.dumps(chunk_json(id_, content=content), ensure_ascii=False)
-                yield f"data: {chunk}\n\n"
-
-        except Exception as e:
-            print(f"[Error] ID : {id_} Exception: {e}")
-        finally:
-            if infer_task.finish_reason is None:
-                infer_task.finish_reason = "cancel"
-    
-    async def chat(id_, request_data, req: Request):
-        """非流式聊天接口"""
-        try:
-            infer_task = build_task(id_, request_data, req.app.state)
-            await req.app.state.kv_cache_pool.acquire(infer_task)
-            req.app.state.request_queue.sync_q.put(infer_task)
-            output = []
-            while True:
-                if (
-                    infer_task.finish_reason is not None
-                    and infer_task.output_queue.async_q.empty()
-                ):
-                    break
-
-                token = await infer_task.output_queue.async_q.get()
-                content = req.app.state.model.tokenizer.decode(token)
-                output.append(content)
-
-            output_text = "".join(output).strip()
-            response = chunk_json(
-                id_,
-                content=output_text,
-                role="assistant",
-                finish_reason=infer_task.finish_reason or "stop",
-            )
-            return response
-
-        except Exception as e:
-            print(f"[Error] ID: {id_} Exception: {e}")
-            return FastAPIJSONResponse(content={"error": str(e)}, status_code=500)
-        finally:
-            if infer_task.finish_reason is None:
-                infer_task.finish_reason = "cancel"
-    
-    @inference_app.post("/chat/completions")
-    async def chat_completions(req: Request):
-        """聊天完成接口"""
-        data = await req.json()
-        print('-----------------------------------------')
-        print(data)
-        print('-----------------------------------------')
-
-        if not data.get("messages"):
-            if not data.get("prompt"):
-                return FastAPIJSONResponse(content={"error": "No message provided"}, status_code=400)
-            else:
-                data['messages'] = [{"role": "user", "content": data.get("prompt")}]
-
-        stream = data.get("stream", False)
-        id_ = f"cmpl-{uuid.uuid4().hex}"
-        if stream:
-            return FastAPIStreamingResponse(
-                chat_stream(id_, data, req), media_type="text/event-stream"
-            )
-        else:
-            response = await chat(id_, data, req)
-            return FastAPIJSONResponse(content=response)
-    
-    return inference_app, port
+    inference_app = server_obj._create_app()
+    return inference_app, server_obj, config.get('port')
 
 
 def start_inference_service(service_id, config):
@@ -432,7 +579,7 @@ def start_inference_service(service_id, config):
             port = find_free_port(DEFAULT_INFERENCE_PORT)
             config['port'] = port
 
-        inference_app, _ = build_inference_app(service_id, config)
+        inference_app, server_obj, _ = build_inference_app(service_id, config)
         
         # 启动uvicorn服务器
         config_uvicorn = uvicorn.Config(
@@ -458,7 +605,7 @@ def start_inference_service(service_id, config):
         except:
             pass  # 如果无法连接，可能是服务还在启动中
         
-        return inference_app, server, server_thread, port
+        return inference_app, server_obj, server, server_thread, port
     except Exception as e:
         print(f"[ERROR] 启动推理服务失败: {e}")
         import traceback
@@ -473,22 +620,15 @@ def get_service_status(service_id):
     
     service_info = services[service_id]
     
-    # 如果是推理服务模式
-    if service_info.get('inference_app') is not None:
-        # 检查推理服务是否还在运行
-        try:
-            port = service_info.get('port', DEFAULT_INFERENCE_PORT)
-            response = requests.get(f'http://localhost:{port}/docs', timeout=1)
-            status = 'running'
-        except:
-            status = 'stopped'
-        
+    # 如果是进程内推理模式
+    if service_info.get("runtime") is not None:
         return {
-            'status': status,
-            'type': 'inference',
-            'port': port,
-            'config': service_info.get('config', {}),
-            'start_time': service_info.get('start_time', '').isoformat() if service_info.get('start_time') else None
+            "status": "running",
+            "type": "inference",
+            "config": service_info.get("config", {}),
+            "start_time": service_info.get("start_time", "").isoformat()
+            if service_info.get("start_time")
+            else None,
         }
     
     # 传统子进程模式
@@ -546,35 +686,30 @@ def deploy_service(service_id):
         config = parse_config_from_command(command)
         print(f"[INFO] 解析配置: {config}")
         
-        # 如果配置中有model_path且推理模块可用，则使用推理服务模式
-        if config.get('model_path') and INFERENCE_AVAILABLE and FASTAPI_AVAILABLE:
+        # 如果配置中有 model_path 且推理依赖可用，则使用“进程内推理模式”
+        if config.get("model_path") and INFERENCE_AVAILABLE:
             try:
-                inference_app, uvicorn_server, inference_thread, port = start_inference_service(service_id, config)
+                runtime = _build_runtime(service_id, config)
                 
                 services[service_id] = {
                     'process': None,
-                    'inference_app': inference_app,
-                    'uvicorn_server': uvicorn_server,
-                    'inference_thread': inference_thread,
+                    'runtime': runtime,
+                    'runtime_lock': threading.Lock(),
                     'command': command,
                     'config': config,
                     'status': 'running',
                     'start_time': datetime.now(),
-                    'port': port
                 }
                 
-                print(f"[INFO] 服务 {service_id} 部署成功（推理服务模式），已添加到 services 字典")
+                print(f"[INFO] 服务 {service_id} 部署成功（进程内推理模式），已添加到 services 字典")
                 return jsonify({
                     'status': 'deployed',
                     'type': 'inference',
-                    'port': port,
                     'message': '推理服务部署成功'
                 })
             except Exception as e:
                 print(f"[ERROR] 推理服务部署失败: {e}")
                 # 回退到子进程模式
-                if not config.get('model_path'):
-                    raise
                 # 继续执行子进程模式
         
         # 子进程模式（传统方式或回退）
@@ -590,9 +725,8 @@ def deploy_service(service_id):
         
         services[service_id] = {
             'process': process,
-            'inference_app': None,
-            'uvicorn_server': None,
-            'inference_thread': None,
+            'runtime': None,
+            'runtime_lock': threading.Lock(),
             'command': command,
             'config': None,
             'status': 'running',
@@ -621,21 +755,12 @@ def stop_service_internal(service_id):
     
     service_info = services[service_id]
     
-    # 停止推理服务
-    if service_info.get('inference_app'):
+    # 停止进程内推理运行时（释放引用，交由底层/GC 回收）
+    if service_info.get("runtime") is not None:
         try:
-            # 请求 uvicorn 退出（否则端口会一直占用，导致 address already in use）
-            if service_info.get('uvicorn_server') is not None:
-                service_info['uvicorn_server'].should_exit = True
-
-            # 触发shutdown事件
-            if hasattr(service_info['inference_app'].state, 'shutdown_event'):
-                service_info['inference_app'].state.shutdown_event.set()
-            # 等待线程结束
-            if service_info.get('inference_thread'):
-                service_info['inference_thread'].join(timeout=5)
+            service_info["runtime"] = None
         except Exception as e:
-            print(f"[ERROR] 停止推理服务失败: {e}")
+            print(f"[ERROR] 停止推理运行时失败: {e}")
     
     # 停止子进程
     process = service_info.get('process')
@@ -706,9 +831,7 @@ def stop_service(service_id):
         stop_service_internal(service_id)
         
         services[service_id]['process'] = None
-        services[service_id]['inference_app'] = None
-        services[service_id]['uvicorn_server'] = None
-        services[service_id]['inference_thread'] = None
+        services[service_id]['runtime'] = None
         services[service_id]['status'] = 'stopped'
         
         return jsonify({'status': 'stopped', 'message': '服务已停止'})
@@ -730,19 +853,15 @@ def get_service_status_endpoint(service_id):
 
 @app.route('/service/<service_id>/chat/completions', methods=['POST'])
 def chat_completions_proxy(service_id):
-    """聊天完成接口（代理到推理服务）"""
+    """聊天完成接口（进程内推理，不启动独立 HTTP 推理服务）"""
     try:
         if service_id not in services:
             return jsonify({'error': '服务不存在'}), 404
         
         service_info = services[service_id]
-        inference_app = service_info.get('inference_app')
-        
-        if not inference_app:
+        runtime = service_info.get("runtime")
+        if runtime is None:
             return jsonify({'error': '该服务不是推理服务'}), 400
-        
-        port = service_info.get('port', DEFAULT_INFERENCE_PORT)
-        target_url = f'http://localhost:{port}/chat/completions'
         
         # 获取请求数据
         request_data = request.json or {}
@@ -751,61 +870,29 @@ def chat_completions_proxy(service_id):
 
         # 如果是流式响应
         if is_stream:
-            try:
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Accept': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    # 禁用压缩，避免 requests/urllib3 因 gzip 缓冲导致“最后一次性输出”
-                    'Accept-Encoding': 'identity',
-                }
-                response = requests.post(
-                    target_url,
-                    json=request_data,
-                    headers=headers,
-                    timeout=120,
-                    stream=True
-                )
-                
-                def generate():
-                    try:
-                        # 直接原样转发 bytes，避免 iter_lines/换行处理造成缓冲
-                        for chunk in response.iter_content(chunk_size=None):
-                            if chunk:
-                                yield chunk
-                    finally:
-                        try:
-                            response.close()
-                        except Exception:
-                            pass
-                
-                return Response(
-                    stream_with_context(generate()),
-                    mimetype='text/event-stream',
-                    direct_passthrough=True,
-                    headers={
-                        'Cache-Control': 'no-cache',
-                        'Connection': 'keep-alive',
-                        'X-Accel-Buffering': 'no'
-                    }
-                )
-            except requests.exceptions.RequestException as e:
-                return jsonify({'error': f'连接失败: {str(e)}'}), 500
+            lock = service_info.get("runtime_lock") or threading.Lock()
+            def generate_bytes():
+                # 串行化同一服务上的推理，避免 scheduler/kv cache 并发冲突
+                with lock:
+                    for b in _infer_stream(runtime, request_data):
+                        yield b
+
+            return Response(
+                stream_with_context(generate_bytes()),
+                mimetype="text/event-stream",
+                direct_passthrough=True,
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         else:
             # 非流式响应
-            try:
-                response = requests.post(
-                    target_url,
-                    json=request_data,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=120
-                )
-                if response.status_code == 200:
-                    return jsonify(response.json())
-                else:
-                    return jsonify({'error': f'API请求失败: {response.text}'}), response.status_code
-            except requests.exceptions.RequestException as e:
-                return jsonify({'error': f'连接失败: {str(e)}'}), 500
+            lock = service_info.get("runtime_lock") or threading.Lock()
+            with lock:
+                resp_obj = _infer_once(runtime, request_data)
+            return jsonify(resp_obj)
                 
     except Exception as e:
         import traceback

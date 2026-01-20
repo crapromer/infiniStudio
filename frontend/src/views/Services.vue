@@ -66,10 +66,10 @@
 
           <template v-else-if="record.deploy_status === '服务中'">
             <!-- 服务中状态：可以重启、停止、完全停止、进入服务 -->
-            <a-button type="link" @click="restartService(record)" style="color: #faad14; font-weight: 500; padding: 0 8px">重启服务</a-button>
-            <a-button type="link" @click="stopService(record)" style="color: #ff4d4f; font-weight: 500; padding: 0 8px">停止服务</a-button>
+          <a-button type="link" @click="restartService(record)" style="color: #faad14; font-weight: 500; padding: 0 8px">重启服务</a-button>
+          <a-button type="link" @click="stopService(record)" style="color: #ff4d4f; font-weight: 500; padding: 0 8px">停止服务</a-button>
             <a-button type="link" @click="stopServiceAgent(record)" style="color: #cf1322; font-weight: 500; padding: 0 8px">完全停止</a-button>
-            <a-button type="link" @click="enterService(record)" style="color: #52c41a; font-weight: 500; padding: 0 8px">进入服务</a-button>
+          <a-button type="link" @click="enterService(record)" style="color: #52c41a; font-weight: 500; padding: 0 8px">进入服务</a-button>
           </template>
 
           <template v-else-if="record.deploy_status === '关闭中'">
@@ -225,7 +225,7 @@ export default {
       }
       return colors[status] || 'default'
     }
-
+    
     const getDeployStatusText = (status) => {
       const texts = {
         '离线': '离线',
@@ -243,7 +243,7 @@ export default {
         const servicesRes = await refreshServicesStatus()
         services.value = servicesRes.data
         message.success('状态刷新成功')
-
+        
         // 检查是否有操作失败的服务，弹出错误信息
         services.value.forEach(service => {
           if (service.deploy_result) {
@@ -301,7 +301,7 @@ export default {
         services.value = servicesRes.data
         models.value = modelsRes.data
         servers.value = serversRes.data
-
+        
         // 检查是否有操作失败的服务，弹出错误信息
         services.value.forEach(service => {
           if (service.deploy_result) {
@@ -437,7 +437,7 @@ export default {
         setTimeout(async () => {
           await refreshStatus()
           // 再延迟刷新一次确保状态稳定
-          setTimeout(() => {
+        setTimeout(() => {
             refreshStatus()
           }, 2000)
         }, 500)
@@ -456,7 +456,7 @@ export default {
         setTimeout(async () => {
           await refreshStatus()
           // 再延迟刷新一次确保状态稳定
-          setTimeout(() => {
+        setTimeout(() => {
             refreshStatus()
           }, 2000)
         }, 500)

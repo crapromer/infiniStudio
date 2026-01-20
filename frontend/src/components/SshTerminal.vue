@@ -124,7 +124,7 @@ export default {
       // 延迟执行fit，确保DOM完全渲染
       setTimeout(() => {
         if (fitAddon.value) {
-          fitAddon.value.fit()
+      fitAddon.value.fit()
         }
       }, 50)
 
@@ -153,7 +153,7 @@ export default {
             resizeTimer = setTimeout(() => {
               try {
                 if (fitAddon.value && terminal.value) {
-                  fitAddon.value.fit()
+                fitAddon.value.fit()
                   // 调整大小后发送新的终端尺寸到SSH服务器
                   setTimeout(() => {
                     sendTerminalSize()

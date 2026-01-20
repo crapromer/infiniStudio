@@ -682,10 +682,10 @@ def update_service_status(service_id):
         cursor.execute('SELECT * FROM services WHERE id = ?', (service_id,))
         service = dict(cursor.fetchone())
         conn.close()
-
+        
         if not service:
             return
-
+        
         current_status = service.get('deploy_status')
         server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
         
@@ -704,14 +704,14 @@ def update_service_status(service_id):
             conn.commit()
             conn.close()
             return
-
+        
         # 获取第一个服务器的状态（简化处理，实际可以聚合多个服务器状态）
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM servers WHERE id = ?', (server_ids[0],))
         server = dict(cursor.fetchone())
         conn.close()
-
+        
         # 先检查服务器本身是否在线
         server_online = ping_host(server['host_ip'])
 
@@ -721,18 +721,18 @@ def update_service_status(service_id):
         else:
             # 服务器在线，检查服务状态
             result = call_service_agent(server, f'/service/{service_id}/status', 'GET', timeout=5)
-
-            if 'error' in result:
+        
+        if 'error' in result:
                 # 无法访问agent服务，状态为离线
                 db_status = '离线'
-            else:
+        else:
                 # 根据agent返回的状态映射
-                agent_status = result.get('status', 'stopped')
-                if agent_status == 'running':
+            agent_status = result.get('status', 'stopped')
+            if agent_status == 'running':
                     db_status = '服务中'  # 服务正在运行
-                else:
+            else:
                     db_status = '在线'  # 服务器在线但服务未运行
-
+        
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (db_status, service_id))
@@ -759,10 +759,10 @@ def execute_ssh_command(server, command):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(server['host_ip'], port=server['port'],
+        ssh.connect(server['host_ip'], port=server['port'], 
                    username=server['username'], password=server.get('password'),
                    timeout=30)
-
+        
         # 使用here document创建完整的登录shell环境
         # bash -l 会加载所有登录环境变量
         # 使用<< 'EOF' 确保命令中的变量不会被提前展开
@@ -771,16 +771,16 @@ def execute_ssh_command(server, command):
 EOF"""
 
         print(f"[DEBUG] 执行SSH命令: {command}")
-
+        
         stdin, stdout, stderr = ssh.exec_command(full_command, get_pty=True)
-
+        
         # 等待命令执行完成
         exit_status = stdout.channel.recv_exit_status()
-
+        
         # 读取所有输出
         output = stdout.read().decode('utf-8', errors='ignore')
         error = stderr.read().decode('utf-8', errors='ignore')
-
+        
         return {
             'success': exit_status == 0,
             'output': output,
@@ -858,11 +858,11 @@ def deploy_service_thread(service_id, server_ids, deploy_command):
             # 部署失败，设置为在线（服务器在线但服务部署失败）
             status = '在线'
         result_json = json.dumps(deploy_results, ensure_ascii=False)
-        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?',
+        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?', 
                       (status, result_json, service_id))
         conn.commit()
         conn.close()
-
+        
         # 部署完成后立即检查一次状态
         update_service_status(service_id)
     except Exception as e:
@@ -988,14 +988,14 @@ def restart_service(service_id):
     cursor.execute('SELECT * FROM services WHERE id = ?', (service_id,))
     service = dict(cursor.fetchone())
     conn.close()
-
+    
     if not service:
         return jsonify({'error': 'Service not found'}), 404
-
+    
     server_ids = json.loads(service['server_ids']) if service['server_ids'] else []
     if not server_ids:
         return jsonify({'error': 'No servers associated with this service'}), 400
-
+    
     # 在开始重启前立即设置状态为启动中
     conn = get_db()
     cursor = conn.cursor()
@@ -1012,7 +1012,7 @@ def restart_service(service_id):
         server = dict(cursor.fetchone())
         servers.append(server)
     conn.close()
-
+    
     # 执行重启命令（使用部署命令，但添加重启逻辑）
     # 这里假设重启命令就是在部署命令前添加重启逻辑，或者使用相同的命令
     # 实际使用中，可以添加专门的重启命令字段，这里简化处理使用部署命令
@@ -1061,11 +1061,11 @@ def restart_service(service_id):
             # 重启失败，设置为在线（服务器在线但服务重启失败）
             status = '在线'
         result_json = json.dumps(deploy_results, ensure_ascii=False)
-        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?',
+        cursor.execute('UPDATE services SET deploy_status = ?, deploy_result = ? WHERE id = ?', 
                       (status, result_json, service_id))
         conn.commit()
         conn.close()
-
+        
         # 重启完成后立即检查一次状态
         update_service_status(service_id)
     
@@ -1105,7 +1105,7 @@ def stop_service(service_id):
     cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', ('关闭中', service_id))
     conn.commit()
     conn.close()
-
+    
     # 在后台线程中执行停止
     def stop_thread():
         all_success = True
@@ -1150,12 +1150,12 @@ def stop_service(service_id):
         cursor.execute('UPDATE services SET deploy_status = ? WHERE id = ?', (status, service_id))
         conn.commit()
         conn.close()
-
+        
         # 停止后立即检查一次状态（即使agent不可用也检查，确保状态正确）
         update_service_status(service_id)
     
     threading.Thread(target=stop_thread, daemon=True).start()
-
+    
     return jsonify({'message': 'Service stop initiated'})
 
 

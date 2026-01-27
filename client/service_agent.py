@@ -6,10 +6,8 @@
 """
 
 from flask import Flask, request, jsonify, Response, stream_with_context
-import subprocess
 import threading
 import os
-import signal
 import time
 import shlex
 import re
@@ -18,7 +16,7 @@ from datetime import datetime
 import json
 import argparse
 import uuid
-import requests
+import gc
 
 # 推理服务相关导入（新版：参考 inference_server.py，进程内直接调用 InferEngine）
 try:
@@ -34,33 +32,13 @@ try:
     INFERENCE_AVAILABLE = True
 except ImportError as e:
     print(f"[WARNING] 推理依赖未找到: {e}")
-    print("[WARNING] 将回退到子进程模式启动服务")
+    print("[WARNING] 推理依赖不可用，将无法部署推理服务")
     INFERENCE_AVAILABLE = False
-
-def get_env_with_path():
-    """获取包含PATH的环境变量字典"""
-    env = os.environ.copy()
-    # 确保PATH包含常见的系统路径
-    common_paths = [
-        '/usr/local/sbin',
-        '/usr/local/bin',
-        '/usr/sbin',
-        '/usr/bin',
-        '/sbin',
-        '/bin'
-    ]
-    current_path = env.get('PATH', '')
-    for path in common_paths:
-        if path not in current_path:
-            current_path = f"{path}:{current_path}"
-    env['PATH'] = current_path
-    return env
 
 app = Flask(__name__)
 
 # 存储服务进程信息
 # {service_id: {
-#     'process': subprocess.Popen or None,
 #     'runtime': dict or None,  # 进程内推理运行时资源
 #     'runtime_lock': threading.Lock,
 #     'command': str,
@@ -72,26 +50,6 @@ services = {}
 
 # 默认端口
 DEFAULT_PORT = 8888  # service_agent 监听端口
-DEFAULT_INFERENCE_PORT = 8889  # 推理服务端口（避免与service_agent冲突）
-
-
-def find_free_port(start_port: int, host: str = "0.0.0.0", max_tries: int = 50) -> int:
-    """从 start_port 开始扫描可用端口，避免 'address already in use'。"""
-    port = int(start_port)
-    for _ in range(max_tries):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((host, port))
-            return port
-        except OSError:
-            port += 1
-        finally:
-            try:
-                s.close()
-            except Exception:
-                pass
-    raise RuntimeError(f"无法找到可用端口（从 {start_port} 起扫描 {max_tries} 个）")
 
 
 def parse_deploy_command(command):
@@ -320,6 +278,8 @@ def _build_runtime(service_id: str, config: dict) -> dict:
         "engine": engine,
         "tokenizer": tokenizer,
         "scheduler": scheduler,
+        # stop 时用于通知正在进行的流式推理尽快退出，确保 engine 引用计数归零触发析构
+        "shutdown_event": threading.Event(),
         "config": {
             **config,
             "temperature": temperature,
@@ -375,6 +335,7 @@ def _infer_stream(runtime: dict, request_data: dict):
     engine = runtime["engine"]
     tokenizer = runtime["tokenizer"]
     scheduler = runtime["scheduler"]
+    shutdown_event = runtime.get("shutdown_event")
 
     messages = request_data.get("messages", [])
     input_content = tokenizer.apply_chat_template(
@@ -406,6 +367,19 @@ def _infer_stream(runtime: dict, request_data: dict):
     start_time = time.time()
     # 同步 step loop（不启独立线程）
     while True:
+        # 服务停止：尽快退出，释放 engine 引用
+        try:
+            if shutdown_event is not None and shutdown_event.is_set():
+                req.status = RequestStatus.Canceled
+                req.finish_reason = "cancel"
+                end_chunk = json.dumps(
+                    chunk_json(req_id, finish_reason=req.finish_reason), ensure_ascii=False
+                )
+                yield f"data: {end_chunk}\n\n".encode("utf-8")
+                break
+        except Exception:
+            pass
+
         # 超时保护
         if time.time() - start_time > 1000.0:
             req.status = RequestStatus.Timeout
@@ -529,90 +503,6 @@ def chunk_json(id_, content=None, role=None, finish_reason=None):
     }
 
 
-def build_inference_app(service_id, config):
-    """构建推理服务的FastAPI应用（基于 inference_server.InferenceServer）"""
-    if not INFERENCE_AVAILABLE or not FASTAPI_AVAILABLE:
-        raise RuntimeError("推理服务模块不可用")
-
-    model_path = config.get('model_path') or ''
-    if not model_path:
-        raise RuntimeError("model_path 不能为空")
-
-    # device / dtype 映射到 infinicore 对象
-    device_str = config.get('device') or 'cpu'  # 'cpu'|'cuda'|'moore'|'mlu'
-    infini_device = infinicore.device(device_str, 0)
-
-    dtype_str = (config.get('dtype') or 'float16').lower()
-    if dtype_str == 'float32':
-        infini_dtype = infinicore.float32
-    elif dtype_str == 'bfloat16':
-        infini_dtype = infinicore.bfloat16
-    else:
-        infini_dtype = infinicore.float16
-
-    server_obj = InferenceServer(
-        model_path=model_path,
-        device=infini_device,
-        dtype=infini_dtype,
-        ndev=int(config.get('tp') or 1),
-        max_tokens=int(config.get('max_tokens') or 512),
-        max_batch_size=int(config.get('max_batch_size') or 8),
-        backend=config.get('backend') or 'cpp',
-        num_blocks=int(config.get('num_blocks') or (8 * 1024)),
-        block_size=int(config.get('block_size') or 16),
-        temperature=float(config.get('temperature') or 1.0),
-        top_p=float(config.get('top_p') or 0.8),
-        top_k=int(config.get('top_k') or 1),
-    )
-
-    inference_app = server_obj._create_app()
-    return inference_app, server_obj, config.get('port')
-
-
-def start_inference_service(service_id, config):
-    """在独立线程中启动推理服务"""
-    try:
-        # 动态选择端口：命令指定则优先使用；否则从 DEFAULT_INFERENCE_PORT 起扫描
-        if config.get('port'):
-            port = int(config['port'])
-        else:
-            port = find_free_port(DEFAULT_INFERENCE_PORT)
-            config['port'] = port
-
-        inference_app, server_obj, _ = build_inference_app(service_id, config)
-        
-        # 启动uvicorn服务器
-        config_uvicorn = uvicorn.Config(
-            app=inference_app,
-            host="0.0.0.0",
-            port=port,
-            log_level="info",
-            access_log=False
-        )
-        server = uvicorn.Server(config_uvicorn)
-        
-        # 在独立线程中运行服务器
-        server_thread = threading.Thread(target=server.run, daemon=True)
-        server_thread.start()
-        
-        # 等待服务启动
-        time.sleep(3)
-        
-        # 验证服务是否启动成功
-        try:
-            # 尝试访问健康检查端点（如果存在）或docs端点
-            response = requests.get(f'http://localhost:{port}/docs', timeout=2)
-        except:
-            pass  # 如果无法连接，可能是服务还在启动中
-        
-        return inference_app, server_obj, server, server_thread, port
-    except Exception as e:
-        print(f"[ERROR] 启动推理服务失败: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-
 def get_service_status(service_id):
     """获取服务状态"""
     if service_id not in services:
@@ -631,32 +521,7 @@ def get_service_status(service_id):
             else None,
         }
     
-    # 传统子进程模式
-    process = service_info.get('process')
-    
-    if process is None:
-        return {'status': 'stopped', 'message': '服务未运行'}
-    
-    # 检查进程是否还在运行
-    if process.poll() is None:
-        # 进程正在运行
-        return {
-            'status': 'running',
-            'type': 'subprocess',
-            'pid': process.pid,
-            'command': service_info.get('command', ''),
-            'start_time': service_info.get('start_time', '').isoformat() if service_info.get('start_time') else None
-        }
-    else:
-        # 进程已结束
-        return_code = process.returncode
-        services[service_id]['process'] = None
-        services[service_id]['status'] = 'stopped'
-        return {
-            'status': 'stopped',
-            'return_code': return_code,
-            'message': f'进程已结束，退出码: {return_code}'
-        }
+    return {'status': 'stopped', 'message': '服务未运行'}
 
 
 @app.route('/health', methods=['GET'])
@@ -686,60 +551,27 @@ def deploy_service(service_id):
         config = parse_config_from_command(command)
         print(f"[INFO] 解析配置: {config}")
         
-        # 如果配置中有 model_path 且推理依赖可用，则使用“进程内推理模式”
-        if config.get("model_path") and INFERENCE_AVAILABLE:
-            try:
-                runtime = _build_runtime(service_id, config)
-                
-                services[service_id] = {
-                    'process': None,
-                    'runtime': runtime,
-                    'runtime_lock': threading.Lock(),
-                    'command': command,
-                    'config': config,
-                    'status': 'running',
-                    'start_time': datetime.now(),
-                }
-                
-                print(f"[INFO] 服务 {service_id} 部署成功（进程内推理模式），已添加到 services 字典")
-                return jsonify({
-                    'status': 'deployed',
-                    'type': 'inference',
-                    'message': '推理服务部署成功'
-                })
-            except Exception as e:
-                print(f"[ERROR] 推理服务部署失败: {e}")
-                # 回退到子进程模式
-                # 继续执行子进程模式
-        
-        # 子进程模式（传统方式或回退）
-        env = get_env_with_path()
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            preexec_fn=os.setsid if os.name != 'nt' else None
-        )
-        
+        # 仅支持“进程内推理模式”：必须有 model_path 且推理依赖可用
+        if not INFERENCE_AVAILABLE:
+            return jsonify({'error': '推理依赖不可用，无法部署推理服务'}), 500
+        if not config.get("model_path"):
+            return jsonify({'error': '部署命令缺少 --model_path，无法部署推理服务'}), 400
+
+        runtime = _build_runtime(service_id, config)
         services[service_id] = {
-            'process': process,
-            'runtime': None,
+            'runtime': runtime,
             'runtime_lock': threading.Lock(),
             'command': command,
-            'config': None,
+            'config': config,
             'status': 'running',
             'start_time': datetime.now(),
-            'port': None
         }
-        
-        print(f"[INFO] 服务 {service_id} 部署成功（子进程模式），已添加到 services 字典")
+
+        print(f"[INFO] 服务 {service_id} 部署成功（进程内推理模式），已添加到 services 字典")
         return jsonify({
             'status': 'deployed',
-            'type': 'subprocess',
-            'pid': process.pid,
-            'message': '服务部署成功'
+            'type': 'inference',
+            'message': '推理服务部署成功'
         })
     except Exception as e:
         import traceback
@@ -755,32 +587,78 @@ def stop_service_internal(service_id):
     
     service_info = services[service_id]
     
-    # 停止进程内推理运行时（释放引用，交由底层/GC 回收）
+    # 停止进程内推理运行时（先通知退出流式推理，再断引用触发 C++ 析构释放）
     if service_info.get("runtime") is not None:
         try:
+            rt = service_info.get("runtime") or {}
+            engine = rt.get("engine")
+            scheduler = rt.get("scheduler")
+            tokenizer = rt.get("tokenizer")
+            shutdown_event = rt.get("shutdown_event")
+            lock = service_info.get("runtime_lock")
+
+            # 先通知正在进行的推理/流式请求尽快退出
+            try:
+                if shutdown_event is not None:
+                    shutdown_event.set()
+            except Exception:
+                pass
+
+            # 等待当前推理请求结束（SSE 期间会持有 runtime_lock）
+            acquired = False
+            try:
+                if lock is not None:
+                    acquired = lock.acquire(timeout=15)
+            except Exception:
+                acquired = False
+
+            # 尝试清空 scheduler（如果有队列/缓存）
+            try:
+                if scheduler is not None and hasattr(scheduler, "cache_manager"):
+                    scheduler.cache_manager.reset_req_blocks()
+            except Exception:
+                pass
+
+            # 直接断开所有强引用并 del，触发底层(C++)析构释放资源
+            try:
+                rt.pop("engine", None)
+                rt.pop("scheduler", None)
+                rt.pop("tokenizer", None)
+                rt.pop("shutdown_event", None)
+                rt.pop("config", None)
+                rt.clear()
+            except Exception:
+                pass
+
             service_info["runtime"] = None
+
+            # 显式删除局部变量引用（确保析构尽快发生）
+            try:
+                del engine
+            except Exception:
+                pass
+            try:
+                del scheduler
+            except Exception:
+                pass
+            try:
+                del tokenizer
+            except Exception:
+                pass
+            try:
+                del shutdown_event
+            except Exception:
+                pass
+
+            gc.collect()
+
+            try:
+                if acquired and lock is not None:
+                    lock.release()
+            except Exception:
+                pass
         except Exception as e:
             print(f"[ERROR] 停止推理运行时失败: {e}")
-    
-    # 停止子进程
-    process = service_info.get('process')
-    if process and process.poll() is None:
-        try:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            else:
-                process.terminate()
-            
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                if os.name != 'nt':
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                else:
-                    process.kill()
-                process.wait()
-        except Exception as e:
-            print(f"[ERROR] 停止进程失败: {e}")
 
 
 @app.route('/service/<service_id>/restart', methods=['POST'])
@@ -830,8 +708,6 @@ def stop_service(service_id):
         
         stop_service_internal(service_id)
         
-        services[service_id]['process'] = None
-        services[service_id]['runtime'] = None
         services[service_id]['status'] = 'stopped'
         
         return jsonify({'status': 'stopped', 'message': '服务已停止'})

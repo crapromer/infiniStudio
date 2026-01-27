@@ -26,6 +26,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { io } from 'socket.io-client'
 import { message } from 'ant-design-vue'
+import { getSocketURL } from '../utils/config'
 
 export default {
   name: 'SshTerminal',
@@ -177,7 +178,8 @@ export default {
     }
 
     const connect = () => {
-      socket.value = io('http://localhost:5000', {
+      const socketURL = getSocketURL()
+      socket.value = io(socketURL, {
         transports: ['websocket', 'polling']
       })
 

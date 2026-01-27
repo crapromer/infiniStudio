@@ -1,9 +1,29 @@
 import axios from 'axios'
+import { getApiBaseURL } from '../utils/config'
 
+// 创建 axios 实例，baseURL 会根据环境自动调整
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: getApiBaseURL(),
   timeout: 30000
 })
+
+// 监听配置变化，动态更新 baseURL
+let currentBaseURL = getApiBaseURL()
+const updateApiBaseURL = () => {
+  const newBaseURL = getApiBaseURL()
+  if (newBaseURL !== currentBaseURL) {
+    currentBaseURL = newBaseURL
+    api.defaults.baseURL = newBaseURL
+  }
+}
+
+// 导出更新函数，供设置组件调用
+export const refreshApiConfig = () => {
+  updateApiBaseURL()
+}
+
+// 初始化时更新一次
+updateApiBaseURL()
 
 // 文件上传
 export const uploadFile = (file) => {

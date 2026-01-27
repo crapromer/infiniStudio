@@ -6,6 +6,14 @@
           <span style="font-size: 28px">⚡</span>
           <span>InfiniStudio</span>
         </div>
+        <a-button
+          type="text"
+          @click="showSettings"
+          style="color: white; font-size: 18px; padding: 4px 8px; display: flex; align-items: center; gap: 6px"
+        >
+          <span>⚙️</span>
+          <span style="font-size: 14px">设置</span>
+        </a-button>
       </div>
     </a-layout-header>
     <a-layout>
@@ -82,18 +90,24 @@
         </div>
       </a-layout-content>
     </a-layout>
+    <SettingsModal v-model:open="settingsVisible" @saved="handleSettingsSaved" />
   </a-layout>
 </template>
 
 <script>
 import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import SettingsModal from './components/SettingsModal.vue'
 
 export default {
   name: 'App',
+  components: {
+    SettingsModal
+  },
   setup() {
     const router = useRouter()
     const route = useRoute()
+    const settingsVisible = ref(false)
     
     // 路由名称到菜单key的映射
     const routeToMenuKey = (routeName) => {
@@ -133,9 +147,22 @@ export default {
       }
     })
 
+    // 显示设置弹窗
+    const showSettings = () => {
+      settingsVisible.value = true
+    }
+
+    // 设置保存后的回调
+    const handleSettingsSaved = () => {
+      // 可以在这里添加保存后的逻辑，比如提示刷新页面
+    }
+
     return {
       selectedKeys,
-      handleMenuClick
+      handleMenuClick,
+      settingsVisible,
+      showSettings,
+      handleSettingsSaved
     }
   }
 }

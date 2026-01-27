@@ -2,7 +2,8 @@ const { defineConfig } = require('@vue/cli-service')
 
 module.exports = defineConfig({
   transpileDependencies: true,
-  devServer: {
+  // 开发服务器配置（仅在开发环境生效）
+  devServer: process.env.NODE_ENV === 'development' ? {
     // 允许通过局域网 / WSL2 / Docker 等方式访问时，HMR WebSocket 仍可连接
     host: '0.0.0.0',
     allowedHosts: 'all',
@@ -28,7 +29,8 @@ module.exports = defineConfig({
         changeOrigin: true
       }
     }
-  },
+  } : undefined,
+  // 生产环境使用相对路径，便于部署
   publicPath: process.env.NODE_ENV === 'production' ? './' : '/'
 })
 

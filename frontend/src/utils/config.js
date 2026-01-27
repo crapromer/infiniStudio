@@ -6,7 +6,8 @@
 const CONFIG_KEY = 'infini_studio_config'
 const DEFAULT_CONFIG = {
   backendHost: 'localhost',
-  backendPort: 5000
+  backendPort: 5000,
+  useProxy: true  // 默认使用代理模式（通过 nginx）
 }
 
 /**
@@ -51,15 +52,14 @@ export function saveConfig(config) {
  */
 export function getApiBaseURL() {
   const config = getConfig()
-  const { backendHost, backendPort } = config
+  const { backendHost, backendPort, useProxy } = config
   
-  // 如果是开发环境，使用代理（相对路径）
-  // 开发环境的代理配置在 vue.config.js 中
-  if (process.env.NODE_ENV === 'development') {
+  // 开发环境或使用代理模式：使用相对路径（通过 nginx 代理）
+  if (process.env.NODE_ENV === 'development' || useProxy) {
     return '/api'
   }
   
-  // 生产环境使用完整 URL（从配置中读取）
+  // 生产环境且不使用代理：使用完整 URL（直接访问后端）
   return `http://${backendHost}:${backendPort}/api`
 }
 
@@ -68,10 +68,18 @@ export function getApiBaseURL() {
  */
 export function getSocketURL() {
   const config = getConfig()
-  const { backendHost, backendPort } = config
+  const { backendHost, backendPort, useProxy } = config
   
-  // 开发环境和生产环境都使用完整 URL
-  // 因为 Socket.IO 需要直接连接到后端服务器
+  // 使用代理模式：使用相对路径（通过 nginx 代理）
+  // 注意：Socket.IO 需要通过 window.location 获取当前协议和主机
+  if (useProxy || process.env.NODE_ENV === 'development') {
+    // 使用当前页面的协议和主机，nginx 会代理到后端
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
+    const host = window.location.host
+    return `${protocol}//${host}`
+  }
+  
+  // 不使用代理：直接访问后端服务器
   return `http://${backendHost}:${backendPort}`
 }
 

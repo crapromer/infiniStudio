@@ -28,9 +28,23 @@
           placeholder="请输入后端服务器端口（如：5000）"
         />
       </a-form-item>
+      <a-form-item label="访问模式">
+        <a-radio-group v-model:value="formData.useProxy">
+          <a-radio :value="true">代理模式（推荐）</a-radio>
+          <a-radio :value="false">直接访问</a-radio>
+        </a-radio-group>
+        <div style="margin-top: 8px; color: #8c8c8c; font-size: 12px;">
+          <span v-if="formData.useProxy">
+            通过 nginx 代理访问后端，支持多机器访问
+          </span>
+          <span v-else>
+            直接访问后端服务器，仅限本机或配置的服务器地址
+          </span>
+        </div>
+      </a-form-item>
       <a-alert
         message="提示"
-        description="修改配置后，需要刷新页面才能生效。当前配置仅保存在浏览器本地，不会影响其他用户。"
+        :description="formData.useProxy ? '代理模式：前端通过 nginx 代理访问后端，支持局域网内其他机器访问。修改配置后需要刷新页面才能生效。' : '直接访问模式：前端直接访问后端服务器地址。仅当不使用 nginx 代理时使用此模式。修改配置后需要刷新页面才能生效。'"
         type="info"
         show-icon
         style="margin-top: 16px"
@@ -63,7 +77,8 @@ export default {
     const saving = ref(false)
     const formData = ref({
       backendHost: 'localhost',
-      backendPort: 5000
+      backendPort: 5000,
+      useProxy: true
     })
 
     // 监听 open prop 变化
@@ -85,7 +100,8 @@ export default {
       const config = getConfig()
       formData.value = {
         backendHost: config.backendHost || 'localhost',
-        backendPort: config.backendPort || 5000
+        backendPort: config.backendPort || 5000,
+        useProxy: config.useProxy !== undefined ? config.useProxy : true
       }
     }
 
@@ -112,7 +128,8 @@ export default {
       try {
         const success = saveConfig({
           backendHost: formData.value.backendHost.trim(),
-          backendPort: formData.value.backendPort
+          backendPort: formData.value.backendPort,
+          useProxy: formData.value.useProxy
         })
 
         if (success) {

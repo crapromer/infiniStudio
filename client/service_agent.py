@@ -21,8 +21,9 @@ import gc
 # 推理服务相关导入（新版：参考 inference_server.py，进程内直接调用 InferEngine）
 try:
     import infinicore
-    from infinilm.core.scheduler import Scheduler
-    from infinilm.core.request import RequestStatus, InferenceRequest
+    from infinilm.llm.scheduler import Scheduler
+    from infinilm.llm.request import RequestStatus, InferenceRequest
+    from infinilm.llm.sampling_params import SamplingParams
     from infinilm.distributed import DistConfig
     from infinilm.infer_engine import InferEngine
     from transformers import AutoTokenizer
@@ -293,11 +294,12 @@ def _build_runtime(service_id: str, config: dict) -> dict:
 def _check_request_finished(req, token_id) -> bool:
     """参考 inference_server.py:_check_request_finished"""
     # Check max length
-    if req.get_num_generated_tokens() >= req.max_new_tokens:
+    max_tokens = req.get_max_tokens()
+    if max_tokens is not None and req.get_num_generated_tokens() >= max_tokens:
         req.finish_reason = "length"
         return True
     # Check EOS token
-    if req.eos_token_id and token_id in req.eos_token_id:
+    if req.eos_token_ids and token_id in req.eos_token_ids:
         req.finish_reason = "eos_token"
         return True
     # Check end strings
@@ -346,16 +348,28 @@ def _infer_stream(runtime: dict, request_data: dict):
     input_tokens = tokenizer.encode(input_content)
 
     req_id = f"cmpl-{uuid.uuid4().hex}"
+    sampling_params = SamplingParams(
+        max_tokens=request_data.get("max_tokens", cfg.get("max_tokens", 512)),
+        temperature=request_data.get("temperature", cfg.get("temperature", 1.0)),
+        top_k=request_data.get("top_k", cfg.get("top_k", 1)),
+        top_p=request_data.get("top_p", cfg.get("top_p", 0.8)),
+    )
+    eos_token_ids = engine.config.eos_token_id
+    if eos_token_ids is None:
+        eos_token_ids = []
+    elif isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+
+    # 注意：InferenceRequest 的参数签名已变更，必须使用关键字参数避免位置参数错位
     req = InferenceRequest(
-        req_id,
-        request_data,
-        None,  # FastAPI Request 不可用，传 None（仅用于断连检查/日志）
-        input_tokens,
-        request_data.get("max_tokens", cfg.get("max_tokens", 512)),
-        request_data.get("temperature", cfg.get("temperature", 1.0)),
-        request_data.get("top_k", cfg.get("top_k", 1)),
-        request_data.get("top_p", cfg.get("top_p", 0.8)),
-        engine.config.eos_token_id,
+        request_id=req_id,
+        prompt=input_content,
+        prompt_token_ids=input_tokens,
+        sampling_params=sampling_params,
+        eos_token_ids=eos_token_ids,
+        arrival_time=time.time(),
+        request_data=request_data,
+        http_request=None,
     )
 
     scheduler.add_request(req)
@@ -370,7 +384,7 @@ def _infer_stream(runtime: dict, request_data: dict):
         # 服务停止：尽快退出，释放 engine 引用
         try:
             if shutdown_event is not None and shutdown_event.is_set():
-                req.status = RequestStatus.Canceled
+                req.status = RequestStatus.CANCELED
                 req.finish_reason = "cancel"
                 end_chunk = json.dumps(
                     chunk_json(req_id, finish_reason=req.finish_reason), ensure_ascii=False
@@ -382,7 +396,7 @@ def _infer_stream(runtime: dict, request_data: dict):
 
         # 超时保护
         if time.time() - start_time > 1000.0:
-            req.status = RequestStatus.Timeout
+            req.status = RequestStatus.TIMEOUT
             req.finish_reason = "timeout"
             err_chunk = json.dumps(
                 chunk_json(req_id, content="[Request timeout]", finish_reason="timeout"),
@@ -432,7 +446,7 @@ def _infer_stream(runtime: dict, request_data: dict):
             _r.generated_text += token_text
 
             if _check_request_finished(_r, token_id):
-                _r.status = RequestStatus.Finished
+                _r.status = RequestStatus.FINISHED
                 _r.finished_time = time.time()
 
             # SSE 输出本 token

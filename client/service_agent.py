@@ -144,12 +144,12 @@ def parse_config_from_command(command):
         or config.get('max-batch-size')
         or config.get('max_batch')
         or config.get('max-batch')
-        or 8
+        or 1
     )
     try:
         max_batch_size = int(max_batch_size)
     except Exception:
-        max_batch_size = 8
+        max_batch_size = 1
 
     # backend / dtype / sampling
     backend = config.get('backend') or 'cpp'
@@ -157,7 +157,7 @@ def parse_config_from_command(command):
     temperature = config.get('temperature') or 1.0
     top_p = config.get('top_p') or config.get('top-p') or 0.8
     top_k = config.get('top_k') or config.get('top-k') or 1
-    num_blocks = config.get('num_blocks') or config.get('num-blocks') or 8 * 1024
+    num_blocks = config.get('num_blocks') or config.get('num-blocks') or 32
     block_size = config.get('block_size') or config.get('block-size') or 16
     enable_paged_attn = config.get('enable_paged_attn') or config.get('enable-paged-attn')
 
@@ -176,7 +176,7 @@ def parse_config_from_command(command):
     try:
         num_blocks = int(num_blocks)
     except Exception:
-        num_blocks = 8 * 1024
+        num_blocks = 32
     try:
         block_size = int(block_size)
     except Exception:
@@ -243,9 +243,9 @@ def _build_runtime(service_id: str, config: dict) -> dict:
 
     tp = int(config.get("tp") or 1)
     max_tokens = int(config.get("max_tokens") or 512)
-    max_batch_size = int(config.get("max_batch_size") or 8)
+    max_batch_size = int(config.get("max_batch_size") or 1)
     backend = config.get("backend") or "cpp"
-    num_blocks = int(config.get("num_blocks") or (8 * 1024))
+    num_blocks = int(config.get("num_blocks") or (32))
     block_size = int(config.get("block_size") or 16)
 
     temperature = float(config.get("temperature") or 1.0)
@@ -299,13 +299,17 @@ def _build_runtime(service_id: str, config: dict) -> dict:
         print(f"[WARNING] llama decoder patch 失败: {e}")
 
     # KV Cache 配置（参考脚本：支持 StaticKVCacheConfig 和 PagedKVCacheConfig）
-    # 注意：这里使用默认配置，实际使用时根据请求动态创建
+    # 注意：这里使用默认配置，实际使用时在 _infer_once 中会根据请求动态创建
     if enable_paged_attn:
         cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
     else:
         # 对于 StaticKVCacheConfig，需要 max_batch_size 和 max_cache_len
-        # 这里先使用 PagedKVCacheConfig，实际使用时根据请求动态创建
-        cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
+        # 使用配置中的 max_tokens 估算初始容量（实际使用时会在 _infer_once 中根据请求动态创建）
+        initial_capacity = max_tokens + 512  # 预留一些空间用于输入 tokens
+        cache_config = StaticKVCacheConfig(
+            max_batch_size=max_batch_size,
+            max_cache_len=initial_capacity
+        )
     
     engine.reset_cache(cache_config)
 

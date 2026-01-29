@@ -25,11 +25,12 @@ try:
     from infinilm.llm.request import RequestStatus, InferenceRequest
     from infinilm.llm.sampling_params import SamplingParams
     from infinilm.distributed import DistConfig
-    from infinilm.infer_engine import InferEngine
+    from infinilm.infer_engine import InferEngine, GenerationConfig
     from transformers import AutoTokenizer
     from tokenizers import decoders as _dec
-    from infinilm.cache.cache import PagedKVCacheConfig
+    from infinilm.cache.cache import PagedKVCacheConfig, StaticKVCacheConfig
     from infinilm.modeling_utils import load_model_state_dict_by_file
+    import numpy as np
     INFERENCE_AVAILABLE = True
 except ImportError as e:
     print(f"[WARNING] 推理依赖未找到: {e}")
@@ -103,20 +104,20 @@ def parse_config_from_command(command):
     # 兼容旧字段/新字段
     model_path = config.get('model_path') or config.get('model-path') or ''
 
-    # device flags（inference_server.py 的 CLI 风格：--cpu/--nvidia/...）
+    # device flags（参考脚本的 CLI 风格：--cpu/--nvidia/...）
     device_flag = 'cpu'
-    if config.get('nvidia'):
+    if config.get('cpu'):
+        device_flag = 'cpu'
+    elif config.get('nvidia'):
         device_flag = 'cuda'
     elif config.get('metax'):
         device_flag = 'cuda'
+    elif config.get('moore'):
+        device_flag = 'musa'  # 参考脚本中使用 musa
     elif config.get('iluvatar'):
         device_flag = 'cuda'
-    elif config.get('moore'):
-        device_flag = 'moore'
     elif config.get('cambricon'):
         device_flag = 'mlu'
-    elif config.get('cpu'):
-        device_flag = 'cpu'
 
     # tp（张量并行）/ndev 兼容
     tp = config.get('tp') or config.get('ndev') or 1
@@ -125,8 +126,14 @@ def parse_config_from_command(command):
     except Exception:
         tp = 1
 
-    # max_tokens / max_batch_size
-    max_tokens = config.get('max_tokens') or config.get('max-tokens') or config.get('max_tokens'.replace('-', '_'))
+    # max_tokens / max_new_tokens / max_batch_size
+    max_tokens = (
+        config.get('max_tokens') 
+        or config.get('max-tokens')
+        or config.get('max_new_tokens')
+        or config.get('max-new-tokens')
+        or 512
+    )
     try:
         max_tokens = int(max_tokens) if max_tokens is not None else 512
     except Exception:
@@ -152,6 +159,7 @@ def parse_config_from_command(command):
     top_k = config.get('top_k') or config.get('top-k') or 1
     num_blocks = config.get('num_blocks') or config.get('num-blocks') or 8 * 1024
     block_size = config.get('block_size') or config.get('block-size') or 16
+    enable_paged_attn = config.get('enable_paged_attn') or config.get('enable-paged-attn')
 
     try:
         temperature = float(temperature)
@@ -173,6 +181,19 @@ def parse_config_from_command(command):
         block_size = int(block_size)
     except Exception:
         block_size = 16
+    # 正确处理布尔值：支持字符串 "True"/"False" 和布尔值
+    try:
+        if enable_paged_attn is None:
+            enable_paged_attn = False
+        elif isinstance(enable_paged_attn, bool):
+            enable_paged_attn = enable_paged_attn
+        elif isinstance(enable_paged_attn, str):
+            # 处理字符串形式的布尔值
+            enable_paged_attn = enable_paged_attn.lower() in ('true', '1', 'yes', 'on')
+        else:
+            enable_paged_attn = bool(enable_paged_attn)
+    except Exception:
+        enable_paged_attn = False
 
     # port 可选：如果命令未指定，则后续动态分配，避免端口冲突
     port = None
@@ -184,7 +205,7 @@ def parse_config_from_command(command):
 
     return {
         'model_path': model_path,
-        'device': device_flag,           # 'cpu' | 'cuda' | 'moore' | 'mlu'
+        'device': device_flag,           # 'cpu' | 'cuda' | 'musa' | 'mlu'
         'dtype': dtype,                  # 'float16' | 'float32' | 'bfloat16'
         'tp': tp,                        # tensor parallel
         'max_tokens': max_tokens,
@@ -195,6 +216,7 @@ def parse_config_from_command(command):
         'temperature': temperature,
         'top_p': top_p,
         'top_k': top_k,
+        'enable_paged_attn': enable_paged_attn,
         'port': port,
     }
 
@@ -229,10 +251,20 @@ def _build_runtime(service_id: str, config: dict) -> dict:
     temperature = float(config.get("temperature") or 1.0)
     top_p = float(config.get("top_p") or 0.8)
     top_k = int(config.get("top_k") or 1)
+    # 正确处理布尔值：支持字符串 "True"/"False" 和布尔值
+    enable_paged_attn_raw = config.get("enable_paged_attn")
+    if enable_paged_attn_raw is None:
+        enable_paged_attn = False
+    elif isinstance(enable_paged_attn_raw, bool):
+        enable_paged_attn = enable_paged_attn_raw
+    elif isinstance(enable_paged_attn_raw, str):
+        enable_paged_attn = enable_paged_attn_raw.lower() in ('true', '1', 'yes', 'on')
+    else:
+        enable_paged_attn = bool(enable_paged_attn_raw)
 
     print(
         f"[INFO] 初始化推理运行时: service_id={service_id}, model_path={model_path}, device={device_str}, "
-        f"dtype={dtype_str}, tp={tp}, backend={backend}"
+        f"dtype={dtype_str}, tp={tp}, backend={backend}, enable_paged_attn={enable_paged_attn}"
     )
 
     engine = InferEngine(
@@ -244,9 +276,9 @@ def _build_runtime(service_id: str, config: dict) -> dict:
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    # llama decoder 修复（与 inference_server.py 保持一致）
+    # llama decoder 修复（参考脚本保持一致）
     try:
-        if "llama" in engine.config.model_type:
+        if "llama" == engine.config.model_type:
             backend_tok = getattr(tokenizer, "backend_tokenizer", None)
             target = getattr(backend_tok, "_tokenizer", backend_tok)
             norm = getattr(target, "normalizer", None)
@@ -266,7 +298,15 @@ def _build_runtime(service_id: str, config: dict) -> dict:
     except Exception as e:
         print(f"[WARNING] llama decoder patch 失败: {e}")
 
-    cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
+    # KV Cache 配置（参考脚本：支持 StaticKVCacheConfig 和 PagedKVCacheConfig）
+    # 注意：这里使用默认配置，实际使用时根据请求动态创建
+    if enable_paged_attn:
+        cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
+    else:
+        # 对于 StaticKVCacheConfig，需要 max_batch_size 和 max_cache_len
+        # 这里先使用 PagedKVCacheConfig，实际使用时根据请求动态创建
+        cache_config = PagedKVCacheConfig(num_blocks=num_blocks, block_size=block_size)
+    
     engine.reset_cache(cache_config)
 
     scheduler = Scheduler(
@@ -463,33 +503,76 @@ def _infer_stream(runtime: dict, request_data: dict):
 
 
 def _infer_once(runtime: dict, request_data: dict) -> dict:
-    """非流式推理：同步 step 直到结束，最后返回完整响应"""
-    output_text_parts = []
-    for b in _infer_stream(runtime, {**request_data, "stream": True}):
-        try:
-            s = b.decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        # 只拼 content（忽略 [DONE] / finish_reason chunk）
-        if not s.startswith("data: "):
-            continue
-        payload = s[len("data: ") :].strip()
-        if payload == "[DONE]":
-            break
-        try:
-            obj = json.loads(payload)
-            choices = (obj or {}).get("choices") or []
-            if choices and isinstance(choices, list):
-                delta = choices[0].get("delta") or {}
-                c = delta.get("content") or choices[0].get("text")
-                if c:
-                    output_text_parts.append(c)
-        except Exception:
-            continue
+    """非流式推理：使用 model.generate() 方法（参考脚本）"""
+    cfg = runtime["config"]
+    engine = runtime["engine"]
+    tokenizer = runtime["tokenizer"]
+    shutdown_event = runtime.get("shutdown_event")
 
-    full_text = "".join(output_text_parts).strip()
+    # 检查是否被取消
+    if shutdown_event is not None and shutdown_event.is_set():
+        raise RuntimeError("服务已停止")
+
+    messages = request_data.get("messages", [])
+    prompt = tokenizer.apply_chat_template(
+        conversation=messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    
+    # 编码输入（参考脚本）
+    input_ids_list = tokenizer.batch_encode_plus([prompt])["input_ids"]
+    input_ids_infini = infinicore.from_list(input_ids_list)
+
+    # 获取生成参数
+    max_new_tokens = request_data.get("max_tokens", cfg.get("max_tokens", 512))
+    temperature = request_data.get("temperature", cfg.get("temperature", 1.0))
+    top_k = request_data.get("top_k", cfg.get("top_k", 1))
+    top_p = request_data.get("top_p", cfg.get("top_p", 0.8))
+    enable_paged_attn = cfg.get("enable_paged_attn", False)
+
+    # 根据请求动态创建 KV Cache（参考脚本）
+    if enable_paged_attn:
+        batch_size = 1
+        max_total_tokens = max_new_tokens + len(input_ids_list[0])
+        cache_config = PagedKVCacheConfig(
+            num_blocks=(max_total_tokens // 16 + 1) * batch_size, 
+            block_size=16
+        )
+    else:
+        batch_size = 1
+        initial_capacity = max_new_tokens + len(input_ids_list[0])
+        cache_config = StaticKVCacheConfig(
+            max_batch_size=batch_size, 
+            max_cache_len=initial_capacity
+        )
+    engine.reset_cache(cache_config)
+
+    # 创建 GenerationConfig（参考脚本）
+    gen_config = GenerationConfig(
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+    )
+
+    # 调用 generate 方法（参考脚本）
+    output_ids = engine.generate(
+        input_ids_infini,
+        gen_config,
+        _measure_and_log_time=False,
+    )
+
+    # 解码输出（参考脚本）
+    numpy_output_ids = np.array([output_id.to_numpy()[0] for output_id in output_ids])
+    output_text = tokenizer.decode(numpy_output_ids, skip_special_tokens=True)
+    
+    # 移除输入部分，只保留生成的部分
+    if prompt in output_text:
+        output_text = output_text[len(prompt):].strip()
+
     rid = f"cmpl-{uuid.uuid4().hex}"
-    return chunk_json(rid, content=full_text, role="assistant", finish_reason="stop")
+    return chunk_json(rid, content=output_text, role="assistant", finish_reason="stop")
 
 
 def chunk_json(id_, content=None, role=None, finish_reason=None):

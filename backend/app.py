@@ -1782,6 +1782,19 @@ def execute_command_thread(server, command_content, session_id):
             'status': 'running'
         })
         
+        # 获取该服务器的命令行参数
+        command_args = server.get('command_args', '')
+        
+        # 如果命令行参数不为空，添加到命令的最后一行
+        if command_args:
+            # 将命令按行分割
+            command_lines = command_content.strip().split('\n')
+            if command_lines:
+                # 在最后一行添加参数
+                last_line = command_lines[-1]
+                command_lines[-1] = f"{last_line} {command_args}"
+                command_content = '\n'.join(command_lines)
+        
         # 调用command_client执行命令
         response = call_command_agent(
             server,

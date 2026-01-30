@@ -60,12 +60,11 @@ def execute_command_streaming(command, task_id):
             if 'args' in command and command['args']:
                 exec_command += f" {command['args']}"
             
-            # 使用bash -l确保加载所有环境变量（.bashrc, .bash_profile等）
-            full_command = f"""bash -l << 'EOF'
-{exec_command}
-EOF"""
-            # 对于脚本，使用heredoc方式
-            use_heredoc = True
+            # 使用bash -l -c执行，确保加载所有环境变量（.bashrc, .bash_profile等）
+            # 与命令执行方式保持一致
+            import shlex
+            full_command = f"bash -l -c {shlex.quote(exec_command)}"
+            use_heredoc = False
         else:
             # 直接执行命令
             if isinstance(command, list):
@@ -94,12 +93,13 @@ EOF"""
             os.close(slave_fd)
             
             # 执行命令
+            # 统一使用bash -l -c方式执行，确保环境变量被正确加载
             if use_heredoc:
-                # heredoc格式，直接执行
+                # heredoc格式（保留兼容性，但通常不会执行到这里）
                 os.execv('/bin/bash', ['/bin/bash', '-l', '-c', full_command])
             else:
-                # bash -l -c格式，命令已经在exec_command中
-                # 直接传递给bash -c
+                # bash -l -c格式，直接使用exec_command
+                # exec_command已经包含了完整的命令（python3 script.py args 或 shell命令）
                 os.execv('/bin/bash', ['/bin/bash', '-l', '-c', exec_command])
         else:
             # 父进程

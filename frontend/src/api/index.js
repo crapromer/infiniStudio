@@ -156,3 +156,5 @@ export const getTaskResult = (id) => api.get(`/tasks/${id}/result`)
 // 统计信息
 export const getStats = () => api.get('/stats')
 
+// 跨平台测试
+export const runCrossPlatformTest = (data) => api.post('/cross-platform-test/run', data)

@@ -76,6 +76,12 @@
             </template>
             <span style="font-weight: 500">计划任务</span>
           </a-menu-item>
+          <a-menu-item key="crossPlatformTest" :style="{ marginBottom: '8px', borderRadius: '8px', marginLeft: '12px', marginRight: '12px' }">
+            <template #icon>
+              <span style="font-size: 18px">🧪</span>
+            </template>
+            <span style="font-weight: 500">跨平台测试</span>
+          </a-menu-item>
         </a-menu>
       </a-layout-sider>
       <a-layout-content :style="{ 
@@ -119,7 +125,8 @@ export default {
         'servers': 'servers',
         'services': 'services',
         'serviceChat': 'services',
-        'tasks': 'tasks'
+        'tasks': 'tasks',
+        'crossPlatformTest': 'crossPlatformTest'
       }
       return mapping[routeName] || 'overview'
     }

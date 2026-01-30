@@ -42,3 +42,5 @@ frontend/build/
 .DS_Store
 Thumbs.db
 
+**/infini.db
+

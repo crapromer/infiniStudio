@@ -7,6 +7,7 @@ import Servers from '../views/Servers.vue'
 import Services from '../views/Services.vue'
 import ServiceChat from '../views/ServiceChat.vue'
 import Tasks from '../views/Tasks.vue'
+import CrossPlatformTest from '../views/CrossPlatformTest.vue'
 
 const routes = [
   {
@@ -48,6 +49,11 @@ const routes = [
     path: '/tasks',
     name: 'tasks',
     component: Tasks
+  },
+  {
+    path: '/cross-platform-test',
+    name: 'crossPlatformTest',
+    component: CrossPlatformTest
   }
 ]
 

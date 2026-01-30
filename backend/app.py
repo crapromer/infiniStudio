@@ -1735,6 +1735,231 @@ def handle_disconnect():
             pass
         del ssh_connections[session_id]
 
+# ==================== 跨平台测试 ====================
+
+def call_command_agent(server, endpoint, method='POST', data=None, stream=False, timeout=300):
+    """
+    调用命令代理接口
+    server: 服务器信息字典
+    endpoint: 接口路径，如 '/command/execute'
+    method: HTTP方法
+    data: 请求数据
+    stream: 是否流式返回
+    timeout: 超时时间（秒）
+    """
+    try:
+        # command_client 使用9090端口（与service_agent的8888区分）
+        agent_port = 9090
+        url = f"http://{server['host_ip']}:{agent_port}{endpoint}"
+        
+        if method == 'GET':
+            response = requests.get(url, timeout=timeout, stream=stream)
+        elif method == 'POST':
+            response = requests.post(url, json=data, timeout=timeout, stream=stream)
+        else:
+            return {'error': f'Unsupported method: {method}'}
+        
+        if stream:
+            return response
+        else:
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {'error': f'HTTP {response.status_code}: {response.text}'}
+    except requests.exceptions.RequestException as e:
+        return {'error': f'连接失败: {str(e)}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def execute_python_script_thread(server, script_content, session_id):
+    """通过agent在后台线程中执行Python脚本并实时发送输出"""
+    try:
+        # 发送开始状态
+        emit_func = lambda event, data: socketio.emit(event, data) if session_id.startswith('http_') else socketio.emit(event, data, room=session_id)
+        
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'running'
+        })
+        
+        # 调用command_client执行脚本
+        response = call_command_agent(
+            server,
+            '/command/execute',
+            method='POST',
+            data={'script': script_content},
+            stream=True,
+            timeout=300
+        )
+        
+        if isinstance(response, dict) and 'error' in response:
+            # 连接失败
+            emit_func('script_error', {
+                'server_id': server['id'],
+                'error': response['error']
+            })
+            emit_func('script_status', {
+                'server_id': server['id'],
+                'status': 'error'
+            })
+            return
+        
+        # 处理流式响应（Server-Sent Events格式）
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                
+                # SSE格式: data: {...}
+                if line.startswith('data: '):
+                    data_str = line[6:]  # 去掉 'data: ' 前缀
+                    try:
+                        data = json.loads(data_str)
+                        msg_type = data.get('type', '')
+                        
+                        if msg_type == 'output':
+                            # 输出数据
+                            output_data = data.get('data', '')
+                            is_error = data.get('is_error', False)
+                            emit_func('script_output', {
+                                'server_id': server['id'],
+                                'output': output_data,
+                                'is_error': is_error
+                            })
+                        elif msg_type == 'status':
+                            # 状态更新
+                            status = data.get('status', '')
+                            if status in ['completed', 'error']:
+                                emit_func('script_status', {
+                                    'server_id': server['id'],
+                                    'status': status
+                                })
+                                if status == 'error':
+                                    return_code = data.get('return_code', -1)
+                                    emit_func('script_error', {
+                                        'server_id': server['id'],
+                                        'error': f'脚本执行失败，退出码: {return_code}'
+                                    })
+                        elif msg_type == 'error':
+                            # 错误信息
+                            error_msg = data.get('data', '未知错误')
+                            emit_func('script_error', {
+                                'server_id': server['id'],
+                                'error': error_msg
+                            })
+                            emit_func('script_status', {
+                                'server_id': server['id'],
+                                'status': 'error'
+                            })
+                    except json.JSONDecodeError:
+                        # 忽略无法解析的行
+                        continue
+                        
+        except Exception as e:
+            error_msg = str(e)
+            emit_func('script_error', {
+                'server_id': server['id'],
+                'error': f'读取输出失败: {error_msg}'
+            })
+            emit_func('script_status', {
+                'server_id': server['id'],
+                'status': 'error'
+            })
+        
+    except Exception as e:
+        error_msg = str(e)
+        emit_func = lambda event, data: socketio.emit(event, data) if session_id.startswith('http_') else socketio.emit(event, data, room=session_id)
+        emit_func('script_error', {
+            'server_id': server['id'],
+            'error': error_msg
+        })
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'error'
+        })
+
+@socketio.on('run_script')
+def handle_run_script(data):
+    """通过SocketIO执行跨平台测试"""
+    script_content = data.get('script', '')
+    server_ids = data.get('server_ids', [])
+    session_id = request.sid
+    
+    if not script_content:
+        emit('script_error', {'error': '脚本内容不能为空'})
+        return
+    
+    if not server_ids:
+        emit('script_error', {'error': '请至少选择一个服务器'})
+        return
+    
+    # 获取服务器信息
+    conn = get_db()
+    cursor = conn.cursor()
+    servers = []
+    for server_id in server_ids:
+        cursor.execute('SELECT * FROM servers WHERE id = ?', (server_id,))
+        row = cursor.fetchone()
+        if row:
+            servers.append(dict(row))
+    conn.close()
+    
+    if len(servers) != len(server_ids):
+        emit('script_error', {'error': '部分服务器不存在'})
+        return
+    
+    # 在后台线程中为每个服务器执行脚本
+    for server in servers:
+        thread = threading.Thread(
+            target=execute_python_script_thread,
+            args=(server, script_content, session_id),
+            daemon=True
+        )
+        thread.start()
+    
+    emit('script_started', {'message': '脚本已开始执行'})
+
+@app.route('/api/cross-platform-test/run', methods=['POST'])
+def run_cross_platform_test():
+    """执行跨平台测试（HTTP接口，用于兼容）"""
+    data = request.json
+    script_content = data.get('script', '')
+    server_ids = data.get('server_ids', [])
+    
+    if not script_content:
+        return jsonify({'error': '脚本内容不能为空'}), 400
+    
+    if not server_ids:
+        return jsonify({'error': '请至少选择一个服务器'}), 400
+    
+    # 获取服务器信息
+    conn = get_db()
+    cursor = conn.cursor()
+    servers = []
+    for server_id in server_ids:
+        cursor.execute('SELECT * FROM servers WHERE id = ?', (server_id,))
+        row = cursor.fetchone()
+        if row:
+            servers.append(dict(row))
+    conn.close()
+    
+    if len(servers) != len(server_ids):
+        return jsonify({'error': '部分服务器不存在'}), 404
+    
+    # 创建一个临时会话ID（用于HTTP请求）
+    session_id = f'http_{uuid.uuid4().hex}'
+    
+    # 在后台线程中为每个服务器执行脚本
+    for server in servers:
+        thread = threading.Thread(
+            target=execute_python_script_thread,
+            args=(server, script_content, session_id),
+            daemon=True
+        )
+        thread.start()
+    
+    return jsonify({'message': '脚本已开始执行', 'session_id': session_id})
+
 if __name__ == '__main__':
     socketio.run(app, debug=True, port=5000, host='0.0.0.0', allow_unsafe_werkzeug=True)
 

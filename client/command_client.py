@@ -64,6 +64,8 @@ def execute_command_streaming(command, task_id):
             full_command = f"""bash -l << 'EOF'
 {exec_command}
 EOF"""
+            # 对于脚本，使用heredoc方式
+            use_heredoc = True
         else:
             # 直接执行命令
             if isinstance(command, list):
@@ -71,9 +73,11 @@ EOF"""
             else:
                 exec_command = command
             
-            full_command = f"""bash -l << 'EOF'
-{exec_command}
-EOF"""
+            # 对于cd等内置命令，使用bash -l -c来执行
+            # 这样可以正确处理shell内置命令
+            import shlex
+            full_command = f"bash -l -c {shlex.quote(exec_command)}"
+            use_heredoc = False
         
         # 创建伪终端（pty），模拟invoke_shell行为
         # 这样可以获得完整的shell环境，包括所有环境变量
@@ -90,7 +94,13 @@ EOF"""
             os.close(slave_fd)
             
             # 执行命令
-            os.execv('/bin/bash', ['/bin/bash', '-l', '-c', full_command])
+            if use_heredoc:
+                # heredoc格式，直接执行
+                os.execv('/bin/bash', ['/bin/bash', '-l', '-c', full_command])
+            else:
+                # bash -l -c格式，命令已经在exec_command中
+                # 直接传递给bash -c
+                os.execv('/bin/bash', ['/bin/bash', '-l', '-c', exec_command])
         else:
             # 父进程
             os.close(slave_fd)

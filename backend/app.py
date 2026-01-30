@@ -1771,6 +1771,42 @@ def call_command_agent(server, endpoint, method='POST', data=None, stream=False,
     except Exception as e:
         return {'error': str(e)}
 
+def execute_command_thread(server, command_content, session_id):
+    """通过agent在后台线程中执行命令并实时发送输出"""
+    try:
+        # 发送开始状态
+        emit_func = lambda event, data: socketio.emit(event, data) if session_id.startswith('http_') else socketio.emit(event, data, room=session_id)
+        
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'running'
+        })
+        
+        # 调用command_client执行命令
+        response = call_command_agent(
+            server,
+            '/command/execute',
+            method='POST',
+            data={'command': command_content},
+            stream=True,
+            timeout=300
+        )
+        
+        # 处理流式响应（与execute_python_script_thread相同）
+        _process_stream_response(response, server, session_id, emit_func)
+        
+    except Exception as e:
+        error_msg = str(e)
+        emit_func = lambda event, data: socketio.emit(event, data) if session_id.startswith('http_') else socketio.emit(event, data, room=session_id)
+        emit_func('script_error', {
+            'server_id': server['id'],
+            'error': error_msg
+        })
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'error'
+        })
+
 def execute_python_script_thread(server, script_content, session_id):
     """通过agent在后台线程中执行Python脚本并实时发送输出"""
     try:
@@ -1798,79 +1834,8 @@ def execute_python_script_thread(server, script_content, session_id):
             timeout=300
         )
         
-        if isinstance(response, dict) and 'error' in response:
-            # 连接失败
-            emit_func('script_error', {
-                'server_id': server['id'],
-                'error': response['error']
-            })
-            emit_func('script_status', {
-                'server_id': server['id'],
-                'status': 'error'
-            })
-            return
-        
-        # 处理流式响应（Server-Sent Events格式）
-        try:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                
-                # SSE格式: data: {...}
-                if line.startswith('data: '):
-                    data_str = line[6:]  # 去掉 'data: ' 前缀
-                    try:
-                        data = json.loads(data_str)
-                        msg_type = data.get('type', '')
-                        
-                        if msg_type == 'output':
-                            # 输出数据
-                            output_data = data.get('data', '')
-                            is_error = data.get('is_error', False)
-                            emit_func('script_output', {
-                                'server_id': server['id'],
-                                'output': output_data,
-                                'is_error': is_error
-                            })
-                        elif msg_type == 'status':
-                            # 状态更新
-                            status = data.get('status', '')
-                            if status in ['completed', 'error']:
-                                emit_func('script_status', {
-                                    'server_id': server['id'],
-                                    'status': status
-                                })
-                                if status == 'error':
-                                    return_code = data.get('return_code', -1)
-                                    emit_func('script_error', {
-                                        'server_id': server['id'],
-                                        'error': f'脚本执行失败，退出码: {return_code}'
-                                    })
-                        elif msg_type == 'error':
-                            # 错误信息
-                            error_msg = data.get('data', '未知错误')
-                            emit_func('script_error', {
-                                'server_id': server['id'],
-                                'error': error_msg
-                            })
-                            emit_func('script_status', {
-                                'server_id': server['id'],
-                                'status': 'error'
-                            })
-                    except json.JSONDecodeError:
-                        # 忽略无法解析的行
-                        continue
-                        
-        except Exception as e:
-            error_msg = str(e)
-            emit_func('script_error', {
-                'server_id': server['id'],
-                'error': f'读取输出失败: {error_msg}'
-            })
-            emit_func('script_status', {
-                'server_id': server['id'],
-                'status': 'error'
-            })
+        # 处理流式响应
+        _process_stream_response(response, server, session_id, emit_func)
         
     except Exception as e:
         error_msg = str(e)
@@ -1884,17 +1849,101 @@ def execute_python_script_thread(server, script_content, session_id):
             'status': 'error'
         })
 
+def _process_stream_response(response, server, session_id, emit_func):
+    """处理流式响应的通用函数"""
+    if isinstance(response, dict) and 'error' in response:
+        # 连接失败
+        emit_func('script_error', {
+            'server_id': server['id'],
+            'error': response['error']
+        })
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'error'
+        })
+        return
+    
+    # 处理流式响应（Server-Sent Events格式）
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            
+            # SSE格式: data: {...}
+            if line.startswith('data: '):
+                data_str = line[6:]  # 去掉 'data: ' 前缀
+                try:
+                    data = json.loads(data_str)
+                    msg_type = data.get('type', '')
+                    
+                    if msg_type == 'output':
+                        # 输出数据
+                        output_data = data.get('data', '')
+                        is_error = data.get('is_error', False)
+                        emit_func('script_output', {
+                            'server_id': server['id'],
+                            'output': output_data,
+                            'is_error': is_error
+                        })
+                    elif msg_type == 'status':
+                        # 状态更新
+                        status = data.get('status', '')
+                        if status in ['completed', 'error']:
+                            emit_func('script_status', {
+                                'server_id': server['id'],
+                                'status': status
+                            })
+                            if status == 'error':
+                                return_code = data.get('return_code', -1)
+                                emit_func('script_error', {
+                                    'server_id': server['id'],
+                                    'error': f'执行失败，退出码: {return_code}'
+                                })
+                    elif msg_type == 'error':
+                        # 错误信息
+                        error_msg = data.get('data', '未知错误')
+                        emit_func('script_error', {
+                            'server_id': server['id'],
+                            'error': error_msg
+                        })
+                        emit_func('script_status', {
+                            'server_id': server['id'],
+                            'status': 'error'
+                        })
+                except json.JSONDecodeError:
+                    # 忽略无法解析的行
+                    continue
+                    
+    except Exception as e:
+        error_msg = str(e)
+        emit_func('script_error', {
+            'server_id': server['id'],
+            'error': f'读取输出失败: {error_msg}'
+        })
+        emit_func('script_status', {
+            'server_id': server['id'],
+            'status': 'error'
+        })
+
 @socketio.on('run_script')
 def handle_run_script(data):
     """通过SocketIO执行跨平台测试"""
+    execution_mode = data.get('execution_mode', 'script')  # 'script' 或 'command'
     script_content = data.get('script', '')
+    command_content = data.get('command', '')
     server_ids = data.get('server_ids', [])
     server_args = data.get('server_args', {})  # 获取每个服务器的命令行参数
     session_id = request.sid
     
-    if not script_content:
-        emit('script_error', {'error': '脚本内容不能为空'})
-        return
+    # 根据执行模式检查内容
+    if execution_mode == 'script':
+        if not script_content:
+            emit('script_error', {'error': '脚本内容不能为空'})
+            return
+    else:
+        if not command_content:
+            emit('script_error', {'error': '命令内容不能为空'})
+            return
     
     if not server_ids:
         emit('script_error', {'error': '请至少选择一个服务器'})
@@ -1918,16 +1967,26 @@ def handle_run_script(data):
         emit('script_error', {'error': '部分服务器不存在'})
         return
     
-    # 在后台线程中为每个服务器执行脚本
+    # 在后台线程中为每个服务器执行脚本或命令
     for server in servers:
-        thread = threading.Thread(
-            target=execute_python_script_thread,
-            args=(server, script_content, session_id),
-            daemon=True
-        )
+        if execution_mode == 'script':
+            # 执行Python脚本
+            thread = threading.Thread(
+                target=execute_python_script_thread,
+                args=(server, script_content, session_id),
+                daemon=True
+            )
+        else:
+            # 执行命令
+            thread = threading.Thread(
+                target=execute_command_thread,
+                args=(server, command_content, session_id),
+                daemon=True
+            )
         thread.start()
     
-    emit('script_started', {'message': '脚本已开始执行'})
+    mode_text = '脚本' if execution_mode == 'script' else '命令'
+    emit('script_started', {'message': f'{mode_text}已开始执行'})
 
 @app.route('/api/cross-platform-test/run', methods=['POST'])
 def run_cross_platform_test():

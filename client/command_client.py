@@ -12,6 +12,8 @@ import time
 import uuid
 import json
 import argparse
+import pty
+import select
 from datetime import datetime
 
 app = Flask(__name__)
@@ -33,9 +35,12 @@ DEFAULT_PORT = 9090  # command_client 监听端口（与service_agent区分）
 
 
 def execute_command_streaming(command, task_id):
-    """执行命令并实时返回输出（生成器函数）"""
+    """执行命令并实时返回输出（生成器函数）
+    使用pty（伪终端）模拟invoke_shell行为，确保环境变量被正确加载
+    """
     script_filename = None
-    process = None
+    master_fd = None
+    pid = None
     
     try:
         # 创建临时Python脚本文件
@@ -47,67 +52,157 @@ def execute_command_streaming(command, task_id):
             with open(script_filename, 'w', encoding='utf-8') as f:
                 f.write(script_content)
             os.chmod(script_filename, 0o755)
-            exec_command = ['python3', script_filename]
+            
+            # 构建执行命令
+            exec_command = f'python3 {script_filename}'
             
             # 如果有命令行参数，添加到命令后面
             if 'args' in command and command['args']:
-                import shlex
-                try:
-                    # 使用shlex安全地解析参数
-                    args_list = shlex.split(command['args'])
-                    exec_command.extend(args_list)
-                except:
-                    # 如果解析失败，使用简单分割（不安全但兼容）
-                    args_list = command['args'].split()
-                    exec_command.extend(args_list)
+                exec_command += f" {command['args']}"
+            
+            # 使用bash -l确保加载所有环境变量（.bashrc, .bash_profile等）
+            full_command = f"""bash -l << 'EOF'
+{exec_command}
+EOF"""
         else:
             # 直接执行命令
-            exec_command = command if isinstance(command, list) else command.split()
+            if isinstance(command, list):
+                exec_command = ' '.join(command)
+            else:
+                exec_command = command
+            
+            full_command = f"""bash -l << 'EOF'
+{exec_command}
+EOF"""
         
-        # 启动进程
-        process = subprocess.Popen(
-            exec_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # 合并stderr到stdout
-            text=True,
-            bufsize=1,  # 行缓冲
-            universal_newlines=True
-        )
+        # 创建伪终端（pty），模拟invoke_shell行为
+        # 这样可以获得完整的shell环境，包括所有环境变量
+        master_fd, slave_fd = pty.openpty()
         
-        # 更新任务状态
-        with tasks_lock:
-            executing_tasks[task_id] = {
-                'process': process,
-                'script_content': command.get('script', '') if isinstance(command, dict) else '',
-                'start_time': datetime.now(),
-                'status': 'running',
-                'output': '',
-                'error': ''
-            }
+        # 在子进程中执行命令
+        pid = os.fork()
+        if pid == 0:
+            # 子进程
+            os.close(master_fd)
+            os.dup2(slave_fd, 0)  # stdin
+            os.dup2(slave_fd, 1)  # stdout
+            os.dup2(slave_fd, 2)  # stderr
+            os.close(slave_fd)
+            
+            # 执行命令
+            os.execv('/bin/bash', ['/bin/bash', '-l', '-c', full_command])
+        else:
+            # 父进程
+            os.close(slave_fd)
+            
+            # 更新任务状态
+            with tasks_lock:
+                executing_tasks[task_id] = {
+                    'process': None,  # 使用pid管理
+                    'pid': pid,
+                    'master_fd': master_fd,
+                    'script_content': command.get('script', '') if isinstance(command, dict) else '',
+                    'start_time': datetime.now(),
+                    'status': 'running',
+                    'output': '',
+                    'error': ''
+                }
+            
+            output_buffer = ''
+            return_code = -1
+            
+            # 实时读取输出
+            while True:
+                # 使用select等待数据可读
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                if ready:
+                    try:
+                        data = os.read(master_fd, 1024)
+                        if not data:
+                            # 没有数据了，检查进程状态
+                            try:
+                                wait_result = os.waitpid(pid, os.WNOHANG)
+                                if wait_result[0] == pid:
+                                    return_code = os.WEXITSTATUS(wait_result[1]) if os.WIFEXITED(wait_result[1]) else -1
+                                    break
+                            except (OSError, ChildProcessError):
+                                break
+                            break
+                        
+                        # 解码数据
+                        try:
+                            text = data.decode('utf-8', errors='replace')
+                        except:
+                            text = data.decode('latin-1', errors='replace')
+                        
+                        output_buffer += text
+                        # 实时发送输出（SSE格式）
+                        yield f"data: {json.dumps({'type': 'output', 'data': text, 'is_error': False})}\n\n"
+                    except OSError:
+                        break
+                else:
+                    # 检查进程是否还在运行
+                    try:
+                        # 使用waitpid的非阻塞模式检查进程状态
+                        wait_result = os.waitpid(pid, os.WNOHANG)
+                        if wait_result[0] == pid:
+                            # 进程已结束，读取剩余数据
+                            while True:
+                                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                                if ready:
+                                    try:
+                                        data = os.read(master_fd, 1024)
+                                        if not data:
+                                            break
+                                        text = data.decode('utf-8', errors='replace')
+                                        output_buffer += text
+                                        yield f"data: {json.dumps({'type': 'output', 'data': text, 'is_error': False})}\n\n"
+                                    except OSError:
+                                        break
+                                else:
+                                    break
+                            
+                            # 获取退出码
+                            return_code = os.WEXITSTATUS(wait_result[1]) if os.WIFEXITED(wait_result[1]) else -1
+                            break
+                    except (OSError, ChildProcessError):
+                        # 进程可能已经结束，尝试等待
+                        try:
+                            wait_result = os.waitpid(pid, 0)
+                            return_code = os.WEXITSTATUS(wait_result[1]) if os.WIFEXITED(wait_result[1]) else -1
+                        except (OSError, ChildProcessError):
+                            return_code = -1
+                        break
+            
+            # 确保进程已结束（如果还没结束）
+            if return_code == -1:
+                try:
+                    wait_result = os.waitpid(pid, 0)
+                    return_code = os.WEXITSTATUS(wait_result[1]) if os.WIFEXITED(wait_result[1]) else -1
+                except (OSError, ChildProcessError):
+                    return_code = -1
+            
+            # 更新任务状态
+            with tasks_lock:
+                if task_id in executing_tasks:
+                    executing_tasks[task_id]['status'] = 'completed' if return_code == 0 else 'error'
+                    executing_tasks[task_id]['output'] = output_buffer
+                    executing_tasks[task_id]['return_code'] = return_code
+            
+            # 发送完成状态
+            yield f"data: {json.dumps({'type': 'status', 'status': 'completed' if return_code == 0 else 'error', 'return_code': return_code})}\n\n"
         
-        output_buffer = ''
-        
-        # 实时读取输出
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-            output_buffer += line
-            # 实时发送输出（SSE格式）
-            yield f"data: {json.dumps({'type': 'output', 'data': line, 'is_error': False})}\n\n"
-        
-        # 等待进程完成
-        return_code = process.wait()
-        
-        # 更新任务状态
+    except Exception as e:
+        error_msg = str(e)
+        # 更新任务状态为错误
         with tasks_lock:
             if task_id in executing_tasks:
-                executing_tasks[task_id]['status'] = 'completed' if return_code == 0 else 'error'
-                executing_tasks[task_id]['output'] = output_buffer
-                executing_tasks[task_id]['return_code'] = return_code
+                executing_tasks[task_id]['status'] = 'error'
+                executing_tasks[task_id]['error'] = error_msg
         
-        # 发送完成状态
-        yield f"data: {json.dumps({'type': 'status', 'status': 'completed' if return_code == 0 else 'error', 'return_code': return_code})}\n\n"
-        
+        yield f"data: {json.dumps({'type': 'error', 'data': error_msg})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'status': 'error'})}\n\n"
+    
     except Exception as e:
         error_msg = str(e)
         # 更新任务状态为错误
@@ -129,15 +224,29 @@ def execute_command_streaming(command, task_id):
                 pass
         
         # 确保进程已关闭
-        if process and process.poll() is None:
+        if pid:
             try:
-                process.terminate()
-                process.wait(timeout=5)
-            except:
+                # 尝试终止进程
+                os.kill(pid, 15)  # SIGTERM
+                time.sleep(0.5)
+                # 如果还在运行，强制杀死
                 try:
-                    process.kill()
+                    os.waitpid(pid, os.WNOHANG)
                 except:
-                    pass
+                    try:
+                        os.kill(pid, 9)  # SIGKILL
+                        os.waitpid(pid, 0)
+                    except:
+                        pass
+            except (OSError, ProcessLookupError):
+                pass
+        
+        # 关闭伪终端
+        if master_fd:
+            try:
+                os.close(master_fd)
+            except:
+                pass
 
 
 @app.route('/health', methods=['GET'])

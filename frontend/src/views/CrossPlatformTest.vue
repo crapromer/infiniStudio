@@ -7,39 +7,66 @@
 
     <a-card :bordered="false" style="margin-bottom: 24px">
       <template #title>
-        <div style="display: flex; align-items: center; gap: 8px">
-          <span style="font-size: 18px">📝</span>
-          <span style="font-weight: 600">Python脚本</span>
+        <div style="display: flex; align-items: center; justify-content: space-between">
+          <div style="display: flex; align-items: center; gap: 8px">
+            <span style="font-size: 18px">📝</span>
+            <span style="font-weight: 600">执行内容</span>
+          </div>
+          <a-radio-group v-model:value="executionMode" :disabled="running">
+            <a-radio-button value="script">
+              <span style="margin-right: 4px">🐍</span>
+              Python脚本
+            </a-radio-button>
+            <a-radio-button value="command">
+              <span style="margin-right: 4px">⚡</span>
+              命令
+            </a-radio-button>
+          </a-radio-group>
         </div>
       </template>
-      <div style="margin-bottom: 16px">
-        <a-upload
-          :before-upload="handleFileUpload"
-          :show-upload-list="false"
-          accept=".py"
-        >
-          <template #default>
-            <a-button>
-              <span style="margin-right: 8px">📁</span>
-              上传Python脚本
-            </a-button>
-          </template>
-        </a-upload>
-      </div>
-      <a-textarea
-        v-model:value="scriptContent"
-        :rows="15"
-        placeholder="请输入或上传Python脚本..."
-        style="font-family: 'Courier New', monospace; font-size: 14px"
-      />
+      
+      <!-- Python脚本模式 -->
+      <template v-if="executionMode === 'script'">
+        <div style="margin-bottom: 16px">
+          <a-upload
+            :before-upload="handleFileUpload"
+            :show-upload-list="false"
+            accept=".py"
+          >
+            <template #default>
+              <a-button>
+                <span style="margin-right: 8px">📁</span>
+                上传Python脚本
+              </a-button>
+            </template>
+          </a-upload>
+        </div>
+        <a-textarea
+          v-model:value="scriptContent"
+          :rows="15"
+          placeholder="请输入或上传Python脚本..."
+          style="font-family: 'Courier New', monospace; font-size: 14px"
+        />
+      </template>
+      
+      <!-- 命令模式 -->
+      <template v-else>
+        <a-textarea
+          v-model:value="commandContent"
+          :rows="15"
+          placeholder="请输入要执行的命令，例如：ls -la、python3 -c 'print(Hello)'、echo $PATH 等"
+          style="font-family: 'Courier New', monospace; font-size: 14px"
+        />
+      </template>
+      
       <div style="margin-top: 16px; display: flex; gap: 12px">
         <a-button type="primary" @click="runScript" :loading="running" :disabled="!canRun">
           <span style="margin-right: 8px">▶️</span>
-          运行脚本
+          {{ executionMode === 'script' ? '运行脚本' : '执行命令' }}
         </a-button>
-        <a-button @click="clearScript">
+        <a-button @click="clearContent">
           <span style="margin-right: 8px">🗑️</span>
-          清空脚本
+          清空内容
         </a-button>
       </div>
     </a-card>
@@ -124,7 +151,9 @@ import { getSocketURL, getApiBaseURL } from '../utils/config'
 export default {
   name: 'CrossPlatformTest',
   setup() {
+    const executionMode = ref('script')  // 'script' 或 'command'
     const scriptContent = ref('')
+    const commandContent = ref('')
     const selectedServerIds = ref([])
     const servers = ref([])
     const running = ref(false)
@@ -203,8 +232,12 @@ export default {
       return false // 阻止自动上传
     }
 
-    const clearScript = () => {
-      scriptContent.value = ''
+    const clearContent = () => {
+      if (executionMode.value === 'script') {
+        scriptContent.value = ''
+      } else {
+        commandContent.value = ''
+      }
     }
 
     const connectSocket = () => {
@@ -269,10 +302,19 @@ export default {
     }
 
     const runScript = async () => {
-      if (!scriptContent.value.trim()) {
-        message.warning('请输入Python脚本')
-        return
+      // 根据执行模式检查内容
+      if (executionMode.value === 'script') {
+        if (!scriptContent.value.trim()) {
+          message.warning('请输入Python脚本')
+          return
+        }
+      } else {
+        if (!commandContent.value.trim()) {
+          message.warning('请输入要执行的命令')
+          return
+        }
       }
+      
       if (selectedServerIds.value.length === 0) {
         message.warning('请至少选择一个服务器')
         return
@@ -316,11 +358,20 @@ export default {
           server_args_map[id] = serverArgs.value[id] || ''
         })
         
-        socket.value.emit('run_script', {
-          script: scriptContent.value,
+        // 根据执行模式发送不同的数据
+        const requestData = {
+          execution_mode: executionMode.value,
           server_ids: selectedServerIds.value,
           server_args: server_args_map
-        })
+        }
+        
+        if (executionMode.value === 'script') {
+          requestData.script = scriptContent.value
+        } else {
+          requestData.command = commandContent.value
+        }
+        
+        socket.value.emit('run_script', requestData)
       } catch (error) {
         message.error('执行失败: ' + error.message)
         running.value = false
@@ -331,7 +382,10 @@ export default {
     }
 
     const canRun = computed(() => {
-      return scriptContent.value.trim().length > 0 && 
+      const hasContent = executionMode.value === 'script' 
+        ? scriptContent.value.trim().length > 0
+        : commandContent.value.trim().length > 0
+      return hasContent && 
              selectedServerIds.value.length > 0 && 
              !running.value
     })
@@ -357,6 +411,9 @@ export default {
       serverOptions,
       outputRefs,
       serverArgs,
+      executionMode,
+      scriptContent,
+      commandContent,
       getServerName,
       getServerOutput,
       getServerStatus,
@@ -364,7 +421,7 @@ export default {
       formatOutput,
       clearServerOutput,
       handleFileUpload,
-      clearScript,
+      clearContent,
       runScript,
       canRun
     }

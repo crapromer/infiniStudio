@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -17,7 +20,8 @@ import requests
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# 使用 eventlet 以支持稳定的 websocket（Werkzeug/threading 模式下 websocket 经常不可用/不稳定）
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 DATABASE = os.path.join(os.path.dirname(__file__), '..', 'datasets', 'infini.db')
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads')
@@ -1736,5 +1740,6 @@ def handle_disconnect():
         del ssh_connections[session_id]
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, port=5000, host='0.0.0.0', allow_unsafe_werkzeug=True)
+    # eventlet server
+    socketio.run(app, debug=True, port=5000, host='0.0.0.0')
 

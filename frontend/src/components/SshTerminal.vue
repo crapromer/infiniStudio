@@ -180,7 +180,8 @@ export default {
     const connect = () => {
       const socketURL = getSocketURL()
       socket.value = io(socketURL, {
-        transports: ['websocket', 'polling']
+        // 先 polling 再升级 websocket：后端 websocket 不可用时也能连上，避免一直“连接中”
+        transports: ['polling', 'websocket']
       })
 
       socket.value.on('connect', () => {

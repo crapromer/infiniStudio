@@ -80,6 +80,18 @@
                 {{ getServerStatus(serverId) }}
               </a-tag>
             </div>
+            <div style="margin-bottom: 12px">
+              <a-input
+                v-model:value="serverArgs[serverId]"
+                placeholder="命令行参数（可选，例如：--arg1 value1 --arg2 value2）"
+                :disabled="running"
+                style="font-family: monospace; font-size: 12px"
+              >
+                <template #prefix>
+                  <span style="color: #8c8c8c; font-size: 12px">参数:</span>
+                </template>
+              </a-input>
+            </div>
             <div
               ref="outputRefs"
               :data-server-id="serverId"
@@ -118,6 +130,7 @@ export default {
     const running = ref(false)
     const serverOutputs = ref({})
     const serverStatuses = ref({})
+    const serverArgs = ref({})  // 存储每个服务器的命令行参数
     const socket = ref(null)
     const outputRefs = ref([])
 
@@ -174,6 +187,7 @@ export default {
     const clearServerOutput = (serverId) => {
       serverOutputs.value[serverId] = ''
       serverStatuses.value[serverId] = 'waiting'
+      // 不清空参数，保留用户输入
     }
 
     const handleFileUpload = (file) => {
@@ -269,6 +283,10 @@ export default {
       selectedServerIds.value.forEach(id => {
         serverOutputs.value[id] = ''
         serverStatuses.value[id] = 'running'
+        // 确保每个服务器都有参数字段
+        if (!serverArgs.value[id]) {
+          serverArgs.value[id] = ''
+        }
       })
 
       // 连接Socket（如果未连接）
@@ -290,11 +308,18 @@ export default {
         })
       }
 
-      // 通过SocketIO发送运行请求
+      // 通过SocketIO发送运行请求，包含每个服务器的参数
       try {
+        // 构建服务器参数映射
+        const server_args_map = {}
+        selectedServerIds.value.forEach(id => {
+          server_args_map[id] = serverArgs.value[id] || ''
+        })
+        
         socket.value.emit('run_script', {
           script: scriptContent.value,
-          server_ids: selectedServerIds.value
+          server_ids: selectedServerIds.value,
+          server_args: server_args_map
         })
       } catch (error) {
         message.error('执行失败: ' + error.message)
@@ -331,6 +356,7 @@ export default {
       serverStatuses,
       serverOptions,
       outputRefs,
+      serverArgs,
       getServerName,
       getServerOutput,
       getServerStatus,

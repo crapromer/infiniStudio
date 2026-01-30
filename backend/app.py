@@ -1782,12 +1782,18 @@ def execute_python_script_thread(server, script_content, session_id):
             'status': 'running'
         })
         
+        # 获取该服务器的命令行参数
+        command_args = server.get('command_args', '')
+        
         # 调用command_client执行脚本
         response = call_command_agent(
             server,
             '/command/execute',
             method='POST',
-            data={'script': script_content},
+            data={
+                'script': script_content,
+                'args': command_args  # 传递命令行参数
+            },
             stream=True,
             timeout=300
         )
@@ -1883,6 +1889,7 @@ def handle_run_script(data):
     """通过SocketIO执行跨平台测试"""
     script_content = data.get('script', '')
     server_ids = data.get('server_ids', [])
+    server_args = data.get('server_args', {})  # 获取每个服务器的命令行参数
     session_id = request.sid
     
     if not script_content:
@@ -1901,7 +1908,10 @@ def handle_run_script(data):
         cursor.execute('SELECT * FROM servers WHERE id = ?', (server_id,))
         row = cursor.fetchone()
         if row:
-            servers.append(dict(row))
+            server_dict = dict(row)
+            # 为每个服务器添加对应的命令行参数
+            server_dict['command_args'] = server_args.get(str(server_id), '') or server_args.get(server_id, '')
+            servers.append(server_dict)
     conn.close()
     
     if len(servers) != len(server_ids):

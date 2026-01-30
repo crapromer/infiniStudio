@@ -48,6 +48,18 @@ def execute_command_streaming(command, task_id):
                 f.write(script_content)
             os.chmod(script_filename, 0o755)
             exec_command = ['python3', script_filename]
+            
+            # 如果有命令行参数，添加到命令后面
+            if 'args' in command and command['args']:
+                import shlex
+                try:
+                    # 使用shlex安全地解析参数
+                    args_list = shlex.split(command['args'])
+                    exec_command.extend(args_list)
+                except:
+                    # 如果解析失败，使用简单分割（不安全但兼容）
+                    args_list = command['args'].split()
+                    exec_command.extend(args_list)
         else:
             # 直接执行命令
             exec_command = command if isinstance(command, list) else command.split()
@@ -141,6 +153,7 @@ def execute_command():
         data = request.json
         command = data.get('command', '')
         script = data.get('script', '')
+        args = data.get('args', '')  # 获取命令行参数
         
         if not command and not script:
             return jsonify({'error': 'Command or script is required'}), 400
@@ -151,6 +164,8 @@ def execute_command():
         # 确定执行内容
         if script:
             exec_data = {'script': script}
+            if args:
+                exec_data['args'] = args  # 添加命令行参数
         else:
             exec_data = command
         
